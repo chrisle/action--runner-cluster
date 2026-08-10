@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd service for the arc orchestrator on macOS.
+
+  Install as a per-user LaunchAgent, not a system LaunchDaemon: the macOS
+  process provider needs the runner to inherit a real user session so Xcode,
+  the keychain and code-signing behave the way they do interactively. A
+  LaunchDaemon runs outside any session and signing will fail there.
+
+    cp deploy/launchd/com.arc.orchestrator.plist ~/Library/LaunchAgents/
+    # edit the paths and GITHUB_TOKEN below first
+    launchctl load -w ~/Library/LaunchAgents/com.arc.orchestrator.plist
+    launchctl list | grep arc
+
+  Logs:  tail -f ~/Library/Logs/arc/arc.log
+  Stop:  launchctl unload -w ~/Library/LaunchAgents/com.arc.orchestrator.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.arc.orchestrator</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/arc</string>
+        <string>run</string>
+        <string>-config</string>
+        <string>/Users/CHANGEME/.arc/arc.yaml</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GITHUB_ORG</key>
+        <string>CHANGEME</string>
+        <!--
+          Prefer reading the token from a file the config references, or use a
+          GitHub App with private_key_path. A token here is world-readable to
+          anyone who can read this plist.
+        -->
+        <key>GITHUB_TOKEN</key>
+        <string>CHANGEME</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Do not hammer GitHub if the config is broken and it crash-loops. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/CHANGEME/Library/Logs/arc/arc.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/CHANGEME/Library/Logs/arc/arc.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/CHANGEME/.arc</string>
+
+    <!--
+      Runners are subprocesses of arc and inherit these limits. The default
+      256 open files is not enough for a real build.
+    -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+</dict>
+</plist>

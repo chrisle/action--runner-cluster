@@ -1,0 +1,14 @@
+# Build output
+/bin/
+/dist/
+coverage.out
+
+# Local configuration — contains org names and credentials
+/arc.yaml
+/arc.env
+*.pem
+*.p12
+
+# Local state
+/.arc-state/
+/instances/

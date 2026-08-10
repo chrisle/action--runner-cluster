@@ -1,0 +1,163 @@
+# arc — GitHub Actions runner cluster orchestrator
+#
+# Copy to arc.yaml and edit. Every ${VAR} is read from the environment;
+# ${VAR:-default} makes one optional.
+
+github:
+  # The organization runners register against. One cluster serves every repo
+  # in it — that is the point of registering at org level rather than per repo.
+  org: ${GITHUB_ORG}
+
+  # Authentication. Use one of token or app.
+  #
+  # token: a classic PAT with the admin:org scope. Simplest to set up.
+  # app:   a GitHub App with organization_self_hosted_runners: write. Better
+  #        for anything long-lived: tokens are minted hourly and scoped to the
+  #        installation, and there is no personal account to deactivate.
+  token: ${GITHUB_TOKEN}
+  # app:
+  #   app_id: 123456
+  #   installation_id: 7890123
+  #   private_key_path: /etc/arc/app-private-key.pem
+
+  # How often to look for queued jobs. Every poll is an HTTP conditional
+  # request, so quiet repos answer 304 and cost no rate limit. 10-15s gives
+  # jobs a fast start without much traffic; raise it for a very large org.
+  poll_interval: 15s
+
+  # Which repos get polled. There is no org-wide "list queued jobs" endpoint,
+  # so arc walks each repo's active workflow runs. Narrowing this is the single
+  # biggest lever on API cost in a large org.
+  repos:
+    # Only poll repos pushed to recently. Most orgs have a long tail of
+    # repositories that will never queue a job again.
+    active_within: 720h # 30 days
+    # include: ["service-*", "app"]
+    # exclude: ["archived-*"]
+    refresh_interval: 10m
+
+  # Custom runner groups need GitHub Enterprise Cloud or GHES. Leave empty for
+  # the Default group.
+  # runner_group: self-hosted-cluster
+
+server:
+  # The control API `arc status` and `arc scale` talk to. Keep it on loopback:
+  # it can change scaling and read runner logs, and has only a static token.
+  addr: 127.0.0.1:8730
+  # token: ${ARC_API_TOKEN}
+  # state_dir defaults to a per-user config directory.
+
+log:
+  level: info # debug | info | warn | error
+  format: text # text | json
+
+pools:
+  # -------------------------------------------------------------------------
+  # Linux — Docker containers. The container filesystem is the disposal
+  # boundary: it is destroyed after every job, so no cache can accumulate.
+  # -------------------------------------------------------------------------
+  - name: linux
+    labels: [self-hosted, linux, x64]
+    provider: docker
+    min: 1 # one warm runner so the first job starts immediately
+    max: 8
+    idle_timeout: 5m # how long a surplus runner waits before being culled
+    job_timeout: 6h # force-destroy a runner stuck this long
+    docker:
+      host: unix:///var/run/docker.sock
+      image: ghcr.io/YOU/arc-runner:linux
+      pull: missing # always | missing | never
+      # Keep the job workspace in RAM. Fast, and it guarantees the workspace
+      # never touches disk. Drop it if your jobs check out very large repos.
+      work_tmpfs: true
+      work_tmpfs_size: 8g
+      cpus: 4
+      memory: 8g
+      shm_size: 2g
+      # docker_in_docker: true
+      #   Binds the host's docker socket into the runner so job steps can build
+      #   images. It also gives every workflow in the org root-equivalent
+      #   control of the host daemon. Only enable it if you trust them all.
+
+  # -------------------------------------------------------------------------
+  # Windows — Windows containers, which require a Windows host running Docker
+  # Desktop in Windows-container mode. Reached over SSH so no daemon port is
+  # exposed on the network.
+  #
+  # Windows containers need Hyper-V, which means Windows Pro, Enterprise,
+  # Server or Education. Windows *Home* cannot run them at all — Docker
+  # Desktop will not even offer the mode. Use the process pool below instead.
+  # -------------------------------------------------------------------------
+  - name: windows
+    labels: [self-hosted, windows, x64]
+    provider: docker
+    min: 0 # Windows containers are heavy; keep no warm floor
+    max: 4
+    idle_timeout: 10m
+    docker:
+      host: ssh://runner@windows-box.local
+      image: ghcr.io/YOU/arc-runner:windows
+      isolation: process # process | hyperv
+      memory: 8g
+
+  # -------------------------------------------------------------------------
+  # Windows without containers — for Windows Home, or any host where Hyper-V
+  # is unavailable. The runner runs directly on the machine in a throwaway
+  # directory that is deleted after every job, so caches still cannot pile up.
+  #
+  # Two things to know before choosing this over the pool above:
+  #   - NTFS has no copy-on-write, so each runner is a real ~250 MB copy of
+  #     the template. That is seconds of startup and real disk churn per job.
+  #   - There are no CPU or memory limits. A runaway job can bog down the
+  #     whole machine, where a container would have been capped.
+  #
+  # Create the template first: scripts/setup-windows-template.ps1
+  # -------------------------------------------------------------------------
+  # - name: windows
+  #   labels: [self-hosted, windows, x64]
+  #   provider: process
+  #   min: 0
+  #   max: 2 # each concurrent runner costs a full template copy on disk
+  #   idle_timeout: 10m
+  #   process:
+  #     template_dir: C:\Users\YOU\.arc\runner-template
+
+  # -------------------------------------------------------------------------
+  # macOS — ephemeral processes, not containers.
+  #
+  # macOS cannot be containerized: Docker Desktop on a Mac runs a Linux VM, so
+  # a "macOS container" would be a Linux runner that cannot touch Xcode,
+  # codesigning or the iOS simulators. Instead each runner gets a copy-on-write
+  # clone of a pristine runner installation, and the whole clone is deleted
+  # when the job finishes.
+  #
+  # Create the template first: scripts/setup-macos-template.sh
+  # -------------------------------------------------------------------------
+  - name: macos
+    labels: [self-hosted, macos, arm64]
+    provider: process
+    min: 1
+    max: 3 # bounded by the machine's actual cores and RAM
+    idle_timeout: 10m
+    process:
+      template_dir: /Users/runner/.arc/runner-template
+      # instances_dir defaults to <state_dir>/instances/macos
+      env:
+        # Keeping caches inside the instance directory is what makes them
+        # disposable. Point them at a shared path only if you deliberately
+        # want them to survive between jobs.
+        HOMEBREW_NO_AUTO_UPDATE: "1"
+
+  # -------------------------------------------------------------------------
+  # A specialised pool. A job asking for [self-hosted, linux, gpu] lands here;
+  # a plain [self-hosted, linux] job prefers the generic pool above, because
+  # arc assigns each job to the pool with the fewest extra labels.
+  # -------------------------------------------------------------------------
+  # - name: linux-gpu
+  #   labels: [self-hosted, linux, x64, gpu]
+  #   provider: docker
+  #   min: 0
+  #   max: 2
+  #   docker:
+  #     host: ssh://runner@gpu-box.local
+  #     image: ghcr.io/YOU/arc-runner:cuda

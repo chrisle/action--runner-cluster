@@ -1,0 +1,65 @@
+# systemd unit for the arc orchestrator on Linux.
+#
+#   sudo useradd --system --create-home --home-dir /var/lib/arc --shell /usr/sbin/nologin arc
+#   sudo usermod -aG docker arc          # needed to talk to the docker socket
+#   sudo install -m0755 bin/arc /usr/local/bin/arc
+#   sudo install -d -o arc -g arc /etc/arc
+#   sudo install -m0640 -o arc -g arc arc.yaml /etc/arc/arc.yaml
+#   sudo install -m0600 -o arc -g arc arc.env /etc/arc/arc.env
+#   sudo cp deploy/systemd/arc.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now arc
+#
+# Logs: journalctl -u arc -f
+#
+# Note: membership in the docker group is root-equivalent on the host. That is
+# inherent to any orchestrator that creates containers, but it is worth knowing
+# rather than discovering.
+
+[Unit]
+Description=arc — GitHub Actions runner cluster orchestrator
+Documentation=https://github.com/chrisle/action-runner-cluster
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arc
+Group=arc
+
+# GITHUB_ORG, GITHUB_TOKEN and friends live here, mode 0600.
+EnvironmentFile=/etc/arc/arc.env
+
+ExecStart=/usr/local/bin/arc run -config /etc/arc/arc.yaml
+# There is no reload: pool limits change live with `arc scale`, and anything
+# else (new pools, new images) is a restart. Restarting is cheap — runners are
+# ephemeral and are left to finish their current job.
+
+Restart=always
+RestartSec=10s
+# Back off instead of crash-looping against the GitHub API on a bad config.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Runners are ephemeral and unregister themselves. Give in-flight work a chance
+# to finish rather than failing live builds on a restart.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+# Hardening. NoNewPrivileges and PrivateTmp are safe here; note that arc needs
+# the docker socket, so full isolation is not achievable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/arc
+StateDirectory=arc
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
