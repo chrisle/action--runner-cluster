@@ -19,7 +19,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -27,9 +29,14 @@ import (
 // Item is what the vault provides.
 type Item struct {
 	// Token is the GitHub credential.
-	Token string
+	Token string `json:"token"`
 	// Login is the GitHub account (user or org) runners belong to.
-	Login string
+	Login string `json:"login"`
+	// AccountType is "User" or "Organization", filled in after the login is
+	// verified against GitHub and kept in the cache.
+	AccountType string `json:"account_type,omitempty"`
+	// FetchedAt records when the vault was last read.
+	FetchedAt time.Time `json:"fetched_at,omitempty"`
 }
 
 // execOP is swapped out in tests.
@@ -88,5 +95,54 @@ func Load(ctx context.Context) (*Item, error) {
 		return nil, errors.New("1Password item arc/github has no username field value; " +
 			"set it to the GitHub account (user or org) the runners belong to")
 	}
+	item.FetchedAt = time.Now()
 	return item, nil
+}
+
+// The vault is read once and cached: op can cost an interactive authorization
+// per invocation, and a host running arc as a service should not depend on op
+// being reachable on every restart. A cached token that GitHub stops
+// accepting triggers a fresh vault read (see the caller).
+
+// CachePath is a var so tests can redirect it.
+var CachePath = func() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".arc", "credentials.json")
+}
+
+// ReadCache returns the cached item, or nil when absent or unreadable.
+// Deleting the file is always safe; the next run re-reads the vault.
+func ReadCache() *Item {
+	path := CachePath()
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var item Item
+	if err := json.Unmarshal(raw, &item); err != nil || item.Token == "" || item.Login == "" {
+		return nil
+	}
+	return &item
+}
+
+// WriteCache persists the item with owner-only permissions.
+func WriteCache(item *Item) error {
+	path := CachePath()
+	if path == "" {
+		return errors.New("no home directory for the credentials cache")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(item, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o600)
 }

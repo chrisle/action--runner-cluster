@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -142,32 +144,75 @@ func loadConfigMax(path string, maxRunners int) (*config.Config, error) {
 	return config.Load(path)
 }
 
+// loadVaultItem and probeAccountType are swapped out in tests.
+var (
+	loadVaultItem = opconfig.Load
+
+	// probeAccountType asks GitHub whether the login is a user or an org —
+	// the two register runners through different APIs — and doubles as
+	// validation that the token still authenticates.
+	probeAccountType = func(ctx context.Context, item *opconfig.Item) (string, error) {
+		probe := &config.Config{}
+		probe.GitHub.Owner = item.Login
+		probe.GitHub.Token = item.Token
+		probe.GitHub.APIURL = "https://api.github.com"
+		quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+		gh, err := ghapi.New(probe, quiet)
+		if err != nil {
+			return "", err
+		}
+		return gh.AccountType(ctx, item.Login)
+	}
+)
+
 // autoConfig builds configuration from the 1Password vault: account and token
 // from op://arc/github, one pool for this machine's platform scaling from
 // zero, webhook-driven.
+//
+// The vault is only read on the first run (or when its cached token stops
+// authenticating): the result is cached at ~/.arc/credentials.json so
+// restarts never depend on — or prompt through — the op CLI.
 func autoConfig(maxRunners int) (*config.Config, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	item, err := opconfig.Load(ctx)
-	if err != nil {
-		return nil, err
+	item := opconfig.ReadCache()
+	fromCache := item != nil
+	if item == nil {
+		var err error
+		item, err = loadVaultItem(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// The same login string could name a user or an org, and the two register
-	// runners through different APIs — ask GitHub which this is.
-	probe := &config.Config{}
-	probe.GitHub.Owner = item.Login
-	probe.GitHub.Token = item.Token
-	probe.GitHub.APIURL = "https://api.github.com"
-	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-	gh, err := ghapi.New(probe, quiet)
-	if err != nil {
-		return nil, err
-	}
-	accountType, err := gh.AccountType(ctx, item.Login)
-	if err != nil {
+	accountType, err := probeAccountType(ctx, item)
+	switch {
+	case err == nil:
+	case fromCache && isAuthError(err):
+		// The cached token was rotated or revoked — refresh from the vault.
+		fresh, opErr := loadVaultItem(ctx)
+		if opErr != nil {
+			return nil, fmt.Errorf("cached credentials were rejected by GitHub and the "+
+				"1Password refresh failed: %w", opErr)
+		}
+		item, fromCache = fresh, false
+		if accountType, err = probeAccountType(ctx, item); err != nil {
+			return nil, fmt.Errorf("verify account %q with the vault token: %w", item.Login, err)
+		}
+	case fromCache && item.AccountType != "":
+		// GitHub is unreachable but the cache was validated before: come up
+		// anyway and let the orchestrator retry, instead of a service that
+		// cannot boot without network.
+		accountType = item.AccountType
+	default:
 		return nil, fmt.Errorf("verify account %q with the vault token: %w", item.Login, err)
+	}
+
+	item.AccountType = accountType
+	if err := opconfig.WriteCache(item); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not cache credentials (the vault will be "+
+			"read again next start): %v\n", err)
 	}
 
 	cfg := &config.Config{}
@@ -190,7 +235,18 @@ func autoConfig(maxRunners int) (*config.Config, error) {
 		return nil, err
 	}
 	out.Path = "1Password op://arc/github"
+	if fromCache {
+		out.Path += " (cached)"
+	}
 	return out, nil
+}
+
+// isAuthError reports a definitive credential rejection, as opposed to
+// network trouble or a GitHub outage.
+func isAuthError(err error) bool {
+	var ae *ghapi.APIError
+	return errors.As(err, &ae) &&
+		(ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden)
 }
 
 func newLogger(cfg config.Log) *slog.Logger {
