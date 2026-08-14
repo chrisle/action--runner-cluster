@@ -200,6 +200,15 @@ func (p *Provider) Create(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, fmt.Errorf("clone runner template: %w", err)
 	}
 
+	// buildEnv points TMPDIR at <dir>/_temp, and tools trust TMPDIR to exist —
+	// `go env` hard-fails with "creating work dir: stat …/_temp: no such file
+	// or directory" rather than creating it. The template usually has no
+	// _temp (nothing writes there at template-build time), so create it here
+	// instead of depending on the template's contents.
+	if err := os.MkdirAll(filepath.Join(dir, "_temp"), 0o755); err != nil {
+		return nil, fmt.Errorf("create instance temp dir: %w", err)
+	}
+
 	// Undo on any failure past this point, so a half-built instance never
 	// lingers on disk.
 	success := false
