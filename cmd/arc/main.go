@@ -31,6 +31,7 @@ Commands:
   resume    Undo a drain
   logs      Show a runner instance's output
   doctor    Check configuration, credentials and providers
+  update    Replace this binary with the latest release
   version   Print version information
 
 Run "arc <command> -h" for command flags.
@@ -66,6 +67,8 @@ func main() {
 		err = cmdLogs(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
+	case "update":
+		err = cmdUpdate(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("arc %s (commit %s, built %s)\n", version, commit, date)
 	case "help", "-h", "--help":
