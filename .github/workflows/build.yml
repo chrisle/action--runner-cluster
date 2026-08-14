@@ -153,7 +153,7 @@ jobs:
             -Endpoint "https://wus2.codesigning.azure.net" `
             -CodeSigningAccountName "nowplaying" `
             -CertificateProfileName "nowplaying-desktop" `
-            -Files "dist/arc-windows-amd64.exe" `
+            -Files (Resolve-Path "dist/arc-windows-amd64.exe").Path `
             -FileDigest SHA256 `
             -TimestampRfc3161 "http://timestamp.acs.microsoft.com" `
             -TimestampDigest SHA256
