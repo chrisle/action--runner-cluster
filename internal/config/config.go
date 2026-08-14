@@ -195,8 +195,10 @@ type ProcessSpec struct {
 	// TemplateDir is a pristine actions-runner installation. It is never
 	// modified; each instance gets a copy-on-write clone of it.
 	TemplateDir string `yaml:"template_dir,omitempty"`
-	// InstancesDir is where per-runner clones live. Each is deleted in full
-	// when its runner exits, which is what keeps caches from accumulating.
+	// InstancesDir is where per-runner clones live (default
+	// ~/.arc/instances/<pool>). Each is deleted in full when its runner
+	// exits, which is what keeps caches from accumulating. Avoid paths with
+	// spaces: the actions runner breaks on them.
 	InstancesDir string `yaml:"instances_dir,omitempty"`
 	// Env is extra environment for the runner process.
 	Env map[string]string `yaml:"env,omitempty"`
@@ -433,7 +435,15 @@ func (c *Config) applyDefaults() {
 				}
 			}
 			if p.Process.InstancesDir == "" {
-				p.Process.InstancesDir = filepath.Join(c.Server.StateDir, "instances", p.Name)
+				// Not under state_dir: on macOS that is "~/Library/Application
+				// Support", and the actions runner mis-executes job step
+				// scripts under paths containing spaces. ~/.arc is space-free
+				// and already holds the runner template.
+				if home, err := os.UserHomeDir(); err == nil {
+					p.Process.InstancesDir = filepath.Join(home, ".arc", "instances", p.Name)
+				} else {
+					p.Process.InstancesDir = filepath.Join(c.Server.StateDir, "instances", p.Name)
+				}
 			}
 		}
 	}
