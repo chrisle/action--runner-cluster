@@ -74,9 +74,15 @@ func New(pool *config.Pool, log *slog.Logger) (*Provider, error) {
 func (p *Provider) Kind() string { return config.ProviderProcess }
 
 // Preflight verifies the runner template looks like a real installation and
-// that the instances directory is writable.
+// that the instances directory is writable. A template that does not exist at
+// all is downloaded and installed automatically first.
 func (p *Provider) Preflight(ctx context.Context) error {
 	tmpl := p.spec.TemplateDir
+	if err := p.ensureTemplate(ctx); err != nil {
+		return fmt.Errorf("template_dir %s is missing and could not be set up "+
+			"automatically: %w\nDownload the runner from "+
+			"https://github.com/actions/runner/releases and extract it there", tmpl, err)
+	}
 	info, err := os.Stat(tmpl)
 	if err != nil {
 		return fmt.Errorf("template_dir %s: %w (download the runner from "+
