@@ -126,6 +126,45 @@ func (p *Provider) Preflight(ctx context.Context) error {
 			return fmt.Errorf("preflight_script %s: %w", p.spec.PreflightScript, err)
 		}
 	}
+
+	// The runner is a .NET application, and a fresh Linux host often lacks
+	// the system libraries it needs (libicu chiefly). Without this probe the
+	// failure surfaces as runners that die instantly at job time with
+	// nothing useful in the logs.
+	if runtime.GOOS == "linux" {
+		if err := p.checkRunnerDeps(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkRunnerDeps proves the runner binary can actually execute on this host.
+func (p *Provider) checkRunnerDeps(ctx context.Context) error {
+	listener := filepath.Join(p.spec.TemplateDir, "bin", "Runner.Listener")
+	if _, err := os.Stat(listener); err != nil {
+		return nil // unusual layout; the entrypoint check already governs
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, listener, "--version")
+	cmd.Dir = p.spec.TemplateDir
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	msg := strings.TrimSpace(string(out))
+	low := strings.ToLower(msg + " " + err.Error())
+	for _, marker := range []string{"icu", "shared librar", "globalization", "dotnet", "no such file"} {
+		if strings.Contains(low, marker) {
+			return fmt.Errorf("the runner cannot start on this host — system libraries "+
+				"are missing: %v (%s)\nInstall them with: sudo %s/bin/installdependencies.sh",
+				err, msg, p.spec.TemplateDir)
+		}
+	}
+	// Some other failure: report it at warn level rather than blocking a
+	// host that might still work.
+	p.log.Warn("runner version probe failed; jobs may not start", "error", err, "output", msg)
 	return nil
 }
 
