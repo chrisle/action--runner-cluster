@@ -23,7 +23,10 @@ Usage:
   arc <command> [flags]
 
 Commands:
-  run       Start the orchestrator
+  run       Start the orchestrator in the foreground
+  install   Install arc as a background service and start it
+  start     Start the installed background service
+  stop      Stop the installed background service
   config    Create or edit the configuration with a wizard
   status    Show pools and runners
   scale     Change a pool's min/max at runtime
@@ -56,6 +59,10 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "install":
+		err = cmdInstall(os.Args[2:])
+	case "start", "stop":
+		err = cmdStartStop(os.Args[1])
 	case "config":
 		err = cmdConfig(os.Args[2:])
 	case "status":
