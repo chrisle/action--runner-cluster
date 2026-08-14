@@ -22,7 +22,9 @@ func stubWizardHooks(t *testing.T) {
 		return "", fmt.Errorf("%w: stubbed", errVerifySkipped)
 	}
 	ghOrgs = func() []string { return nil }
-	t.Cleanup(func() { verifyGitHub, ghOrgs = origVerify, origOrgs })
+	origLogin := ghLogin
+	ghLogin = func() string { return "" }
+	t.Cleanup(func() { verifyGitHub, ghOrgs, ghLogin = origVerify, origOrgs, origLogin })
 }
 
 func TestConfigWizardCreates(t *testing.T) {
@@ -31,6 +33,7 @@ func TestConfigWizardCreates(t *testing.T) {
 	input := strings.Join([]string{
 		"",       // auth method → token
 		"",       // token → ${GITHUB_TOKEN}
+		"",       // runners belong to → organization
 		"my-org", // organization
 		"y",      // customize? → yes
 		"30s",    // poll interval
@@ -112,9 +115,9 @@ pools:
 		t.Fatal(err)
 	}
 
-	// All-Enter session: auth method, token, organization, customize (no).
-	// Declining customization must not even ask about the pools.
-	input := strings.Repeat("\n", 4)
+	// All-Enter session: auth method, token, account type, organization,
+	// customize (no). Declining customization must not even ask about pools.
+	input := strings.Repeat("\n", 5)
 	var out bytes.Buffer
 	if err := runConfigWizard(path, strings.NewReader(input), &out); err != nil {
 		t.Fatalf("wizard: %v\noutput:\n%s", err, out.String())
@@ -164,6 +167,7 @@ func createFlowInput(org string) string {
 	return strings.Join([]string{
 		"",  // auth method → token
 		"",  // token → ${GITHUB_TOKEN}
+		"",  // runners belong to → organization
 		org, // organization
 		"",  // customize? → no
 	}, "\n") + "\n"
@@ -197,6 +201,38 @@ func TestConfigWizardDefaultsWithoutCustomization(t *testing.T) {
 	}
 	if got := cfg.GitHub.PollInterval.String(); got != "15s" {
 		t.Errorf("poll_interval = %s, want the 15s default", got)
+	}
+}
+
+func TestConfigWizardPersonalAccount(t *testing.T) {
+	stubWizardHooks(t)
+	ghLogin = func() string { return "chrisle" }
+
+	path := filepath.Join(t.TempDir(), "arc.yaml")
+	input := strings.Join([]string{
+		"",         // auth method → token
+		"",         // token → ${GITHUB_TOKEN}
+		"personal", // runners belong to → personal account
+		"",         // username → prefilled from gh
+		"",         // customize? → no
+	}, "\n") + "\n"
+	var out bytes.Buffer
+	if err := runConfigWizard(path, strings.NewReader(input), &out); err != nil {
+		t.Fatalf("wizard: %v\noutput:\n%s", err, out.String())
+	}
+	raw, _ := os.ReadFile(path)
+	cfg, err := config.ParseEditable(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitHub.Owner != "chrisle" || cfg.GitHub.Org != "" {
+		t.Errorf("github = org %q owner %q, want personal mode with the gh login",
+			cfg.GitHub.Org, cfg.GitHub.Owner)
+	}
+	// The default pool must satisfy personal-mode validation (min 0) — the
+	// wizard's CheckBytes gate would have refused to write otherwise.
+	if len(cfg.Pools) != 1 || cfg.Pools[0].Min != 0 {
+		t.Errorf("pools = %+v, want one default pool with min 0", cfg.Pools)
 	}
 }
 
@@ -238,6 +274,7 @@ func TestConfigWizardVerifyFailureRetry(t *testing.T) {
 		"retry",             // verification failed → retry
 		"",                  // auth method (keep token)
 		"ghp_goodtoken1234", // new token
+		"",                  // runners belong to (keep organization)
 		"",                  // organization (keep)
 	}, "\n") + "\n"
 	var out bytes.Buffer

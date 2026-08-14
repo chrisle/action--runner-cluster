@@ -33,9 +33,13 @@ type Client struct {
 	apiURL string
 	webURL string
 	org    string
-	auth   Authenticator
-	http   *http.Client
-	log    *slog.Logger
+	// owner, when set, puts the client in personal-account mode: repos are
+	// listed from the user's account and runners are registered per repo,
+	// because GitHub has no user-level runners.
+	owner string
+	auth  Authenticator
+	http  *http.Client
+	log   *slog.Logger
 
 	etags *etagCache
 
@@ -79,6 +83,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		apiURL: strings.TrimSuffix(cfg.GitHub.APIURL, "/"),
 		webURL: strings.TrimSuffix(cfg.GitHub.WebURL, "/"),
 		org:    cfg.GitHub.Org,
+		owner:  cfg.GitHub.Owner,
 		auth:   auth,
 		http:   hc,
 		log:    log,
@@ -86,8 +91,20 @@ func New(cfg *config.Config, log *slog.Logger) (*Client, error) {
 	}, nil
 }
 
-// Org returns the configured organization.
-func (c *Client) Org() string { return c.org }
+// Org returns the account runners belong to: the org, or the personal owner.
+func (c *Client) Org() string { return c.entity() }
+
+// entity is the owner segment of /repos/{entity}/{repo} paths.
+func (c *Client) entity() string {
+	if c.owner != "" {
+		return c.owner
+	}
+	return c.org
+}
+
+// RepoLevel reports whether runners are registered per repo (personal
+// account) rather than on the org.
+func (c *Client) RepoLevel() bool { return c.owner != "" }
 
 // WebURL returns the base web URL runners register against.
 func (c *Client) WebURL() string { return c.webURL }

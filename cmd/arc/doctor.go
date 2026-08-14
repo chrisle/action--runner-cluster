@@ -72,33 +72,12 @@ func cmdDoctor(args []string) error {
 	})
 
 	if gh != nil {
-		var runners []ghapi.Runner
-		check("can list org runners (admin:org)", func() (string, error) {
-			var err error
-			runners, err = gh.ListRunners(ctx)
-			if err != nil {
-				if ghapi.IsNotFound(err) {
-					return "", fmt.Errorf("org %q not found, or the credential cannot see it. "+
-						"A classic PAT needs the admin:org scope; a GitHub App needs the "+
-						"organization_self_hosted_runners: write permission", cfg.GitHub.Org)
-				}
-				if ghapi.IsForbidden(err) {
-					return "", fmt.Errorf("permission denied. A classic PAT needs admin:org; "+
-						"a GitHub App needs organization_self_hosted_runners: write: %w", err)
-				}
-				return "", err
-			}
-			busy := 0
-			for _, r := range runners {
-				if r.Busy {
-					busy++
-				}
-			}
-			return fmt.Sprintf("%d registered, %d busy", len(runners), busy), nil
-		})
-
+		// Repos come first: in personal-account mode runners are registered
+		// per repo, so the runner check needs the repo list.
+		var repos []ghapi.Repo
 		check("can enumerate repos to poll", func() (string, error) {
-			repos, err := gh.ListRepos(ctx, ghapi.RepoFilterOpts{
+			var err error
+			repos, err = gh.ListRepos(ctx, ghapi.RepoFilterOpts{
 				Include:      cfg.GitHub.Repos.Include,
 				Exclude:      cfg.GitHub.Repos.Exclude,
 				ActiveWithin: cfg.GitHub.Repos.ActiveWithin.Duration(),
@@ -123,6 +102,43 @@ func cmdDoctor(args []string) error {
 				suffix = fmt.Sprintf(", +%d more", len(repos)-3)
 			}
 			return fmt.Sprintf("%d repo(s): %s%s", len(repos), strings.Join(names, ", "), suffix), nil
+		})
+
+		runnerCheck := "can list org runners (admin:org)"
+		if cfg.GitHub.Owner != "" {
+			runnerCheck = "can list repo runners (repo scope)"
+		}
+		var runners []ghapi.Runner
+		check(runnerCheck, func() (string, error) {
+			var err error
+			runners, err = gh.ListRunners(ctx, repos)
+			if err != nil {
+				if cfg.GitHub.Owner != "" {
+					if ghapi.IsNotFound(err) || ghapi.IsForbidden(err) {
+						return "", fmt.Errorf("cannot administer runners on %s's repos. "+
+							"The PAT needs the repo scope (fine-grained: Administration "+
+							"read/write): %w", cfg.GitHub.Owner, err)
+					}
+					return "", err
+				}
+				if ghapi.IsNotFound(err) {
+					return "", fmt.Errorf("org %q not found, or the credential cannot see it. "+
+						"A classic PAT needs the admin:org scope; a GitHub App needs the "+
+						"organization_self_hosted_runners: write permission", cfg.GitHub.Org)
+				}
+				if ghapi.IsForbidden(err) {
+					return "", fmt.Errorf("permission denied. A classic PAT needs admin:org; "+
+						"a GitHub App needs organization_self_hosted_runners: write: %w", err)
+				}
+				return "", err
+			}
+			busy := 0
+			for _, r := range runners {
+				if r.Busy {
+					busy++
+				}
+			}
+			return fmt.Sprintf("%d registered, %d busy", len(runners), busy), nil
 		})
 
 		for _, pool := range cfg.Pools {

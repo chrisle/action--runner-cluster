@@ -178,15 +178,31 @@ func (w *wizard) askGitHubAuth(cfg *config.Config) {
 		}
 	}
 
-	if cfg.GitHub.Org == "" {
-		if orgs := ghOrgs(); len(orgs) > 0 {
-			if len(orgs) > 1 {
-				fmt.Fprintf(w.out, "  your organizations (from gh): %s\n", strings.Join(orgs, ", "))
-			}
-			cfg.GitHub.Org = orgs[0]
-		}
+	accountType := "organization"
+	if cfg.GitHub.Owner != "" {
+		accountType = "personal"
 	}
-	cfg.GitHub.Org = w.askRequired("  organization", cfg.GitHub.Org)
+	switch w.askChoice("  runners belong to", []string{"organization", "personal"}, accountType) {
+	case "organization":
+		cfg.GitHub.Owner = ""
+		if cfg.GitHub.Org == "" {
+			if orgs := ghOrgs(); len(orgs) > 0 {
+				if len(orgs) > 1 {
+					fmt.Fprintf(w.out, "  your organizations (from gh): %s\n", strings.Join(orgs, ", "))
+				}
+				cfg.GitHub.Org = orgs[0]
+			}
+		}
+		cfg.GitHub.Org = w.askRequired("  organization", cfg.GitHub.Org)
+	case "personal":
+		// Personal accounts have no user-level runners: arc registers each
+		// runner against the repo whose queued job it will serve.
+		cfg.GitHub.Org = ""
+		if cfg.GitHub.Owner == "" {
+			cfg.GitHub.Owner = ghLogin()
+		}
+		cfg.GitHub.Owner = w.askRequired("  username", cfg.GitHub.Owner)
+	}
 }
 
 // defaultPool is the zero-question pool for the host: process on macOS and
@@ -258,16 +274,17 @@ func (w *wizard) confirmGitHub(cfg *config.Config) bool {
 
 var errVerifySkipped = errors.New("verification skipped")
 
-// verifyGitHub and ghOrgs are swapped out in tests.
+// verifyGitHub, ghOrgs and ghLogin are swapped out in tests.
 var (
 	verifyGitHub = verifyGitHubLive
 	ghOrgs       = ghOrgsLive
+	ghLogin      = ghLoginLive
 )
 
 // verifyGitHubLive proves the credential can do the one thing arc needs:
-// manage self-hosted runners in the org. Listing runners exercises exactly
-// that permission (admin:org for a PAT, organization_self_hosted_runners for
-// an App) — the same probe arc doctor uses.
+// manage self-hosted runners for the configured account. Listing runners
+// exercises exactly that permission (admin:org for an org PAT; repo scope for
+// a personal account) — the same probe arc doctor uses.
 func verifyGitHubLive(cfg *config.Config) (string, error) {
 	resolved, err := cfg.Resolve()
 	if err != nil {
@@ -278,23 +295,42 @@ func verifyGitHubLive(cfg *config.Config) (string, error) {
 	if err != nil {
 		return "", err // bad credential material, e.g. an unreadable private key
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	runners, err := gh.ListRunners(ctx)
-	if err != nil {
+
+	classify := func(err error) (string, error) {
 		var ae *ghapi.APIError
 		if !errors.As(err, &ae) {
 			return "", fmt.Errorf("%w: cannot reach GitHub: %v", errVerifySkipped, err)
 		}
 		if ghapi.IsNotFound(err) || ghapi.IsForbidden(err) {
+			if resolved.GitHub.Owner != "" {
+				return "", fmt.Errorf("the token cannot administer runners on %s's repos; "+
+					"it needs the repo scope (fine-grained: Administration read/write) (%v)",
+					resolved.GitHub.Owner, err)
+			}
 			return "", fmt.Errorf("org %q not found, or the credential cannot manage its "+
 				"runners. A classic PAT needs the admin:org scope; a GitHub App needs "+
 				"organization_self_hosted_runners: write (%v)", resolved.GitHub.Org, err)
 		}
 		return "", err
 	}
-	return fmt.Sprintf("%s can manage runners in %q (%d currently registered)",
-		gh.AuthDescription(), resolved.GitHub.Org, len(runners)), nil
+
+	repos, err := gh.ListRepos(ctx, ghapi.RepoFilterOpts{
+		Include:      resolved.GitHub.Repos.Include,
+		Exclude:      resolved.GitHub.Repos.Exclude,
+		ActiveWithin: resolved.GitHub.Repos.ActiveWithin.Duration(),
+		Archived:     resolved.GitHub.Repos.Archived,
+	})
+	if err != nil {
+		return classify(err)
+	}
+	runners, err := gh.ListRunners(ctx, repos)
+	if err != nil {
+		return classify(err)
+	}
+	return fmt.Sprintf("%s can manage runners for %q (%d repo(s) visible, %d runner(s) registered)",
+		gh.AuthDescription(), resolved.GitHub.Entity(), len(repos), len(runners)), nil
 }
 
 // ghOrgsLive asks the gh CLI, when installed and logged in, which orgs the
@@ -310,6 +346,21 @@ func ghOrgsLive() []string {
 		return nil
 	}
 	return strings.Fields(string(out))
+}
+
+// ghLoginLive asks the gh CLI for the authenticated user's login, for
+// prefilling personal-account mode. Best-effort like ghOrgsLive.
+func ghLoginLive() string {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "api", "user", "--jq", ".login").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func (w *wizard) editPool(cfg *config.Config, p *config.Pool) {
@@ -383,12 +434,12 @@ func defaultLabels(provider string) []string {
 	return []string{"self-hosted", "linux", "x64"}
 }
 
-// orgPlaceholder is the org for use in suggested image names. An ${ENV}
+// orgPlaceholder is the account for use in suggested image names. An ${ENV}
 // reference cannot be embedded in a registry path suggestion, so fall back to
 // a marker the user will obviously replace.
 func orgPlaceholder(cfg *config.Config) string {
-	if org := cfg.GitHub.Org; org != "" && !config.IsEnvRef(org) {
-		return org
+	if e := cfg.GitHub.Entity(); e != "" && !config.IsEnvRef(e) {
+		return e
 	}
 	return "OWNER"
 }

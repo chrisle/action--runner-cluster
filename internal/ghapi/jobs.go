@@ -11,13 +11,16 @@ import (
 	"time"
 )
 
-// Repo is an org repository the orchestrator may poll.
+// Repo is a repository the orchestrator may poll.
 type Repo struct {
 	Name     string    `json:"name"`
 	FullName string    `json:"full_name"`
 	Archived bool      `json:"archived"`
 	Disabled bool      `json:"disabled"`
 	PushedAt time.Time `json:"pushed_at"`
+	Owner    struct {
+		Login string `json:"login"`
+	} `json:"owner"`
 }
 
 // Job is a workflow job that is waiting for a runner.
@@ -73,12 +76,18 @@ func githubHostedLabel(l string) bool {
 	return false
 }
 
-// ListRepos returns the org's repositories, filtered by the config's rules.
+// ListRepos returns the account's repositories, filtered by the config's rules.
 func (c *Client) ListRepos(ctx context.Context, filter RepoFilterOpts) ([]Repo, error) {
 	var all []Repo
 	// sort=pushed puts recently active repos first, so ActiveWithin can stop
-	// paginating early instead of walking the whole org.
+	// paginating early instead of walking the whole account.
 	p := fmt.Sprintf("/orgs/%s/repos?per_page=100&type=all&sort=pushed&direction=desc", c.org)
+	if c.owner != "" {
+		// /users/{owner}/repos only returns public repos, so personal mode
+		// lists the authenticated user's own repos and then filters to the
+		// configured owner as a guard against a token for the wrong account.
+		p = "/user/repos?per_page=100&affiliation=owner&sort=pushed&direction=desc"
+	}
 
 	cutoff := time.Time{}
 	if filter.ActiveWithin > 0 {
@@ -99,6 +108,9 @@ func (c *Client) ListRepos(ctx context.Context, filter RepoFilterOpts) ([]Repo, 
 				// Sorted by push time, so everything after this is older too.
 				stop = true
 				break
+			}
+			if c.owner != "" && !strings.EqualFold(r.Owner.Login, c.owner) {
+				continue
 			}
 			if r.Disabled {
 				continue
@@ -226,7 +238,7 @@ func (c *Client) repoPendingJobs(ctx context.Context, repo Repo) ([]Job, error) 
 	// Polling only status=queued would miss all of them.
 	for _, status := range []string{"queued", "in_progress"} {
 		p := fmt.Sprintf("/repos/%s/%s/actions/runs?status=%s&per_page=100&exclude_pull_requests=true",
-			c.org, repo.Name, status)
+			c.entity(), repo.Name, status)
 		key := fmt.Sprintf("runs:%s:%s", repo.Name, status)
 
 		var out struct {
@@ -254,7 +266,7 @@ func (c *Client) repoPendingJobs(ctx context.Context, repo Repo) ([]Job, error) 
 
 	var jobs []Job
 	for _, runID := range ids {
-		p := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=100", c.org, repo.Name, runID)
+		p := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=100", c.entity(), repo.Name, runID)
 		key := fmt.Sprintf("jobs:%s:%d", repo.Name, runID)
 
 		var out struct {

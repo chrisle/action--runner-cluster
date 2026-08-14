@@ -133,7 +133,22 @@ func TestValidation(t *testing.T) {
 		{
 			name: "missing org",
 			yaml: "github:\n  token: t\npools:\n  - {name: p, labels: [l], provider: docker, min: 0, max: 1, docker: {image: i}}\n",
-			want: "github.org is required",
+			want: "one of github.org or github.owner is required",
+		},
+		{
+			name: "org and owner together",
+			yaml: "github:\n  org: acme\n  owner: chris\n  token: t\npools:\n  - {name: p, labels: [l], provider: docker, min: 0, max: 1, docker: {image: i}}\n",
+			want: "mutually exclusive",
+		},
+		{
+			name: "personal mode rejects a warm floor",
+			yaml: "github:\n  owner: chris\n  token: t\npools:\n  - {name: p, labels: [l], provider: docker, min: 1, max: 2, docker: {image: i}}\n",
+			want: "min must be 0 with a personal account",
+		},
+		{
+			name: "personal mode rejects app auth",
+			yaml: "github:\n  owner: chris\n  app: {app_id: 1, installation_id: 2, private_key: k}\npools:\n  - {name: p, labels: [l], provider: docker, min: 0, max: 1, docker: {image: i}}\n",
+			want: "not supported with a personal account",
 		},
 		{
 			name: "no credentials",

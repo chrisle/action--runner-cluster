@@ -168,7 +168,7 @@ func (o *Orchestrator) PreflightPool(ctx context.Context, pool string) error {
 func (o *Orchestrator) Run(ctx context.Context) error {
 	interval := o.cfg.GitHub.PollInterval.Duration()
 	o.log.Info("orchestrator started",
-		"org", o.cfg.GitHub.Org,
+		"account", o.cfg.GitHub.Entity(),
 		"pools", len(o.cfg.Pools),
 		"poll_interval", interval,
 		"auth", o.gh.AuthDescription())
@@ -201,10 +201,21 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 // tick is logged and surfaced in the snapshot, and the next tick tries again.
 func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 	start := time.Now()
-	snap := Snapshot{UpdatedAt: start, Org: o.cfg.GitHub.Org}
+	snap := Snapshot{UpdatedAt: start, Org: o.cfg.GitHub.Entity()}
 
-	// 1. What GitHub thinks is registered, and which runners are busy.
-	runners, err := o.gh.ListRunners(ctx)
+	// 1. Which repos are watched. This comes first because in personal-account
+	// mode runners are registered per repo, so the runner listing needs the
+	// repo list.
+	repos, err := o.pollableRepos(ctx)
+	if err != nil {
+		o.log.Error("list repos failed", "error", err)
+		o.recordFailure(fmt.Sprintf("list repos: %v", err))
+		return
+	}
+	snap.ReposWatched = len(repos)
+
+	// 2. What GitHub thinks is registered, and which runners are busy.
+	runners, err := o.gh.ListRunners(ctx, repos)
 	if err != nil {
 		o.log.Error("list runners failed", "error", err)
 		o.recordFailure(fmt.Sprintf("list runners: %v", err))
@@ -215,7 +226,7 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 		byName[r.Name] = r
 	}
 
-	// 2. What each provider actually has, and reap anything finished.
+	// 3. What each provider actually has, and reap anything finished.
 	liveByPool := make(map[string][]provider.Instance, len(o.cfg.Pools))
 	poolErr := make(map[string]string)
 	for _, pool := range o.cfg.Pools {
@@ -227,15 +238,6 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 		}
 		liveByPool[pool.Name] = o.reap(ctx, pool, instances, byName)
 	}
-
-	// 3. What work is waiting.
-	repos, err := o.pollableRepos(ctx)
-	if err != nil {
-		o.log.Error("list repos failed", "error", err)
-		o.recordFailure(fmt.Sprintf("list repos: %v", err))
-		return
-	}
-	snap.ReposWatched = len(repos)
 
 	jobs, err := o.gh.PendingJobs(ctx, repos, 8)
 	if err != nil {
@@ -270,7 +272,8 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 
 	// 5. Act, one pool at a time.
 	for _, pool := range o.cfg.Pools {
-		ps := o.applyPool(ctx, pool, liveByPool[pool.Name], byName, demand.ByPool[pool.Name])
+		ps := o.applyPool(ctx, pool, liveByPool[pool.Name], byName,
+			demand.ByPool[pool.Name], demand.Jobs[pool.Name])
 		if e := poolErr[pool.Name]; e != "" {
 			ps.Error = e
 		}
@@ -332,7 +335,7 @@ func (o *Orchestrator) reap(ctx context.Context, pool *config.Pool, instances []
 			continue // never touch a runner mid-job
 		}
 		o.log.Info("removing orphaned runner registration", "pool", pool.Name, "runner", name, "runner_id", r.ID)
-		if err := o.gh.RemoveRunner(ctx, r.ID); err != nil && !errors.Is(err, ghapi.ErrRunnerBusy) {
+		if err := o.gh.RemoveRunner(ctx, r.Repo, r.ID); err != nil && !errors.Is(err, ghapi.ErrRunnerBusy) {
 			o.log.Warn("failed to remove orphaned runner", "runner", name, "error", err)
 		}
 	}
@@ -345,7 +348,7 @@ func (o *Orchestrator) destroyInstance(ctx context.Context, pool *config.Pool, i
 	// Deregister first. If the instance is destroyed first, GitHub keeps an
 	// offline runner listed and may still try to route a job to it.
 	if r, ok := byName[inst.RunnerName]; ok {
-		if err := o.gh.RemoveRunner(ctx, r.ID); err != nil {
+		if err := o.gh.RemoveRunner(ctx, r.Repo, r.ID); err != nil {
 			if errors.Is(err, ghapi.ErrRunnerBusy) {
 				o.log.Info("runner picked up a job, leaving it alone",
 					"pool", pool.Name, "runner", inst.RunnerName)
@@ -367,8 +370,10 @@ func (o *Orchestrator) destroyInstance(ctx context.Context, pool *config.Pool, i
 	o.mu.Unlock()
 }
 
-// applyPool computes and executes the decision for a single pool.
-func (o *Orchestrator) applyPool(ctx context.Context, pool *config.Pool, live []provider.Instance, byName map[string]ghapi.Runner, demand int) PoolSnapshot {
+// applyPool computes and executes the decision for a single pool. jobs are the
+// queued jobs assigned to this pool, which in personal-account mode determine
+// the repo each new runner registers against.
+func (o *Orchestrator) applyPool(ctx context.Context, pool *config.Pool, live []provider.Instance, byName map[string]ghapi.Runner, demand int, jobs []ghapi.Job) PoolSnapshot {
 	lim := o.limitsFor(pool)
 	drained := o.isDrained(pool.Name)
 	if drained {
@@ -408,7 +413,7 @@ func (o *Orchestrator) applyPool(ctx context.Context, pool *config.Pool, live []
 
 	switch {
 	case decision.Create > 0 && !drained:
-		o.scaleUp(ctx, pool, decision.Create)
+		o.scaleUp(ctx, pool, decision.Create, jobs)
 	case decision.Cull > 0:
 		o.scaleDown(ctx, pool, live, byName, decision.Cull)
 	}
@@ -434,11 +439,30 @@ func (o *Orchestrator) applyPool(ctx context.Context, pool *config.Pool, live []
 }
 
 // scaleUp launches n runners concurrently, bounded by maxCreateConcurrency.
-func (o *Orchestrator) scaleUp(ctx context.Context, pool *config.Pool, n int) {
+// In personal-account mode each runner is registered against the repo of one
+// of the queued jobs it is being created for; a runner can only serve the
+// repo it registered on, so the pairing is what makes GitHub route the job.
+func (o *Orchestrator) scaleUp(ctx context.Context, pool *config.Pool, n int, jobs []ghapi.Job) {
 	groupID, err := o.gh.RunnerGroupID(ctx, o.cfg.EffectiveRunnerGroup(pool))
 	if err != nil {
 		o.log.Error("resolve runner group failed", "pool", pool.Name, "error", err)
 		return
+	}
+
+	repos := make([]string, n)
+	if o.gh.RepoLevel() {
+		for i := range repos {
+			if i < len(jobs) {
+				repos[i] = jobs[i].Repo
+			} else if len(jobs) > 0 {
+				repos[i] = jobs[len(jobs)-1].Repo
+			} else {
+				// No queued job to pin to (a min top-up, which validation
+				// forbids in personal mode). Nothing sensible to register.
+				o.log.Warn("skipping launch with no target repo", "pool", pool.Name)
+				return
+			}
+		}
 	}
 
 	o.log.Info("scaling up", "pool", pool.Name, "count", n)
@@ -447,23 +471,24 @@ func (o *Orchestrator) scaleUp(ctx context.Context, pool *config.Pool, n int) {
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		go func() {
+		go func(repo string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if err := o.launchOne(ctx, pool, groupID); err != nil {
+			if err := o.launchOne(ctx, pool, groupID, repo); err != nil {
 				o.log.Error("launch runner failed", "pool", pool.Name, "error", err)
 			}
-		}()
+		}(repos[i])
 	}
 	wg.Wait()
 }
 
-// launchOne registers a JIT runner and starts an instance for it.
-func (o *Orchestrator) launchOne(ctx context.Context, pool *config.Pool, groupID int64) error {
+// launchOne registers a JIT runner and starts an instance for it. repo is the
+// repository to register against in personal-account mode, empty in org mode.
+func (o *Orchestrator) launchOne(ctx context.Context, pool *config.Pool, groupID int64, repo string) error {
 	name := runnerName(pool.Name)
 
-	jit, err := o.gh.GenerateJITConfig(ctx, name, pool.Labels, groupID, "_work")
+	jit, err := o.gh.GenerateJITConfig(ctx, repo, name, pool.Labels, groupID, "_work")
 	if err != nil {
 		return err
 	}
@@ -480,7 +505,7 @@ func (o *Orchestrator) launchOne(ctx context.Context, pool *config.Pool, groupID
 		// Use a detached context so cleanup still happens during shutdown.
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if rmErr := o.gh.RemoveRunner(cleanupCtx, jit.Runner.ID); rmErr != nil {
+		if rmErr := o.gh.RemoveRunner(cleanupCtx, jit.Runner.Repo, jit.Runner.ID); rmErr != nil {
 			o.log.Warn("failed to remove registration for runner that never started",
 				"runner", name, "runner_id", jit.Runner.ID, "error", rmErr)
 		}
@@ -664,7 +689,7 @@ func (o *Orchestrator) Close() error {
 // recordFailure marks a reconcile pass as having failed outright.
 func (o *Orchestrator) recordFailure(msg string) {
 	o.mu.Lock()
-	o.snapshot.Org = o.cfg.GitHub.Org
+	o.snapshot.Org = o.cfg.GitHub.Entity()
 	o.snapshot.LastError = msg
 	o.snapshot.UpdatedAt = time.Now()
 	o.snapshot.ConsecutiveFailures++

@@ -8,6 +8,13 @@ github:
   # in it — that is the point of registering at org level rather than per repo.
   org: ${GITHUB_ORG}
 
+  # Personal account instead of an org (mutually exclusive with org). GitHub
+  # has no user-level runners, so in this mode arc registers each runner
+  # against the specific repo whose queued job it will serve. Needs a token
+  # with the repo scope; app auth and runner groups do not apply, and pools
+  # must use min: 0 (a warm runner would be pinned to a single repo).
+  # owner: ${GITHUB_USER}
+
   # Authentication. Use one of token or app.
   #
   # token: a classic PAT with the admin:org scope. Simplest to set up.

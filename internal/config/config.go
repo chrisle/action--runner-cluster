@@ -32,8 +32,14 @@ type Config struct {
 
 // GitHub holds API connection and polling settings.
 type GitHub struct {
-	// Org is the GitHub organization runners register against.
-	Org string `yaml:"org"`
+	// Org is the GitHub organization runners register against. Mutually
+	// exclusive with Owner.
+	Org string `yaml:"org,omitempty"`
+	// Owner is a personal account instead of an org. GitHub has no user-level
+	// runners, so in this mode each runner is registered against the specific
+	// repository whose queued job it will serve. Requires a token (PAT with
+	// repo scope); GitHub App auth is not supported here.
+	Owner string `yaml:"owner,omitempty"`
 	// Token is a classic PAT with admin:org. Mutually exclusive with App.
 	Token string `yaml:"token,omitempty"`
 	// App is GitHub App credentials. Preferred over Token for org-wide use.
@@ -432,14 +438,25 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf(format, args...))
 	}
 
-	if c.GitHub.Org == "" {
-		add("github.org is required")
+	switch {
+	case c.GitHub.Org == "" && c.GitHub.Owner == "":
+		add("one of github.org or github.owner is required")
+	case c.GitHub.Org != "" && c.GitHub.Owner != "":
+		add("github.org and github.owner are mutually exclusive")
 	}
 	switch {
 	case c.GitHub.Token == "" && c.GitHub.App == nil:
 		add("one of github.token or github.app is required")
 	case c.GitHub.Token != "" && c.GitHub.App != nil:
 		add("github.token and github.app are mutually exclusive")
+	}
+	if c.GitHub.Owner != "" {
+		if c.GitHub.App != nil {
+			add("github.app is not supported with a personal account (github.owner); use a token")
+		}
+		if c.GitHub.RunnerGroup != "" {
+			add("github.runner_group does not exist for personal accounts; remove it")
+		}
 	}
 	if a := c.GitHub.App; a != nil {
 		if a.AppID == 0 {
@@ -488,6 +505,13 @@ func (c *Config) Validate() error {
 		}
 		if p.Min < 0 {
 			add("%s: min must be >= 0", where)
+		}
+		if c.GitHub.Owner != "" && p.Min > 0 {
+			// A warm runner must be registered somewhere, and on a personal
+			// account "somewhere" is one specific repo — it would sit idle
+			// while every other repo's jobs queue.
+			add("%s: min must be 0 with a personal account (github.owner); "+
+				"runners are registered per repo, so a warm floor cannot serve every repo", where)
 		}
 		if p.Max < 1 {
 			add("%s: max must be >= 1", where)
@@ -543,6 +567,14 @@ func isMacPool(p *Pool) bool {
 		}
 	}
 	return false
+}
+
+// Entity is the account runners belong to: the org, or the personal owner.
+func (g GitHub) Entity() string {
+	if g.Owner != "" {
+		return g.Owner
+	}
+	return g.Org
 }
 
 // Pool returns the named pool, or nil.
