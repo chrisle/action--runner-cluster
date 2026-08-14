@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	"github.com/chrisle/action-runner-cluster/internal/config"
+	"github.com/chrisle/action-runner-cluster/internal/ghapi"
 )
 
 // cmdConfig runs the interactive configuration wizard. With no existing file it
@@ -69,33 +73,7 @@ func runConfigWizard(path string, in io.Reader, out io.Writer) error {
 	fmt.Fprintln(out, "Enter keeps the value in [brackets]; type - to clear one.")
 
 	fmt.Fprintln(out, "\ngithub")
-	cfg.GitHub.Org = w.askRequired("  organization", cfg.GitHub.Org)
-
-	method := "token"
-	if cfg.GitHub.App != nil {
-		method = "app"
-	}
-	switch w.askChoice("  auth method", []string{"token", "app"}, method) {
-	case "token":
-		cfg.GitHub.App = nil
-		tok := cfg.GitHub.Token
-		if tok == "" {
-			tok = "${GITHUB_TOKEN}"
-		}
-		cfg.GitHub.Token = w.askSecret(
-			"  token (a PAT with admin:org, or ${GITHUB_TOKEN} to read the environment)", tok)
-	case "app":
-		cfg.GitHub.Token = ""
-		if cfg.GitHub.App == nil {
-			cfg.GitHub.App = &config.AppAuth{}
-		}
-		a := cfg.GitHub.App
-		a.AppID = w.askInt64("  app id", a.AppID)
-		a.InstallationID = w.askInt64("  installation id", a.InstallationID)
-		if a.PrivateKey == "" { // an inline PEM is left alone
-			a.PrivateKeyPath = w.askRequired("  private key path (PEM)", a.PrivateKeyPath)
-		}
-	}
+	w.askGitHubAuth(cfg)
 	cfg.GitHub.PollInterval = w.askDuration("  poll interval",
 		cfg.GitHub.PollInterval, config.DefaultPollInterval)
 	cfg.GitHub.RunnerGroup = w.ask("  runner group (empty = Default)", cfg.GitHub.RunnerGroup)
@@ -131,6 +109,12 @@ func runConfigWizard(path string, in io.Reader, out io.Writer) error {
 	if w.err != nil {
 		return fmt.Errorf("aborted (%v); nothing was written", w.err)
 	}
+	if !w.confirmGitHub(cfg) {
+		return errors.New("aborted after failed GitHub verification; nothing was written")
+	}
+	if w.err != nil {
+		return fmt.Errorf("aborted (%v); nothing was written", w.err)
+	}
 
 	rendered, err := cfg.Marshal()
 	if err != nil {
@@ -149,6 +133,131 @@ func runConfigWizard(path string, in io.Reader, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "\nWrote %s\nNext: arc doctor  # verify credentials and providers\n", path)
 	return nil
+}
+
+// askGitHubAuth prompts for the org and credentials — the slice of the config
+// that gets re-asked when live verification fails.
+func (w *wizard) askGitHubAuth(cfg *config.Config) {
+	if cfg.GitHub.Org == "" {
+		if orgs := ghOrgs(); len(orgs) > 0 {
+			if len(orgs) > 1 {
+				fmt.Fprintf(w.out, "  your organizations (from gh): %s\n", strings.Join(orgs, ", "))
+			}
+			cfg.GitHub.Org = orgs[0]
+		}
+	}
+	cfg.GitHub.Org = w.askRequired("  organization", cfg.GitHub.Org)
+
+	method := "token"
+	if cfg.GitHub.App != nil {
+		method = "app"
+	}
+	switch w.askChoice("  auth method", []string{"token", "app"}, method) {
+	case "token":
+		cfg.GitHub.App = nil
+		tok := cfg.GitHub.Token
+		if tok == "" {
+			tok = "${GITHUB_TOKEN}"
+		}
+		cfg.GitHub.Token = w.askSecret(
+			"  token (a PAT with admin:org, or ${GITHUB_TOKEN} to read the environment)", tok)
+	case "app":
+		cfg.GitHub.Token = ""
+		if cfg.GitHub.App == nil {
+			cfg.GitHub.App = &config.AppAuth{}
+		}
+		a := cfg.GitHub.App
+		a.AppID = w.askInt64("  app id", a.AppID)
+		a.InstallationID = w.askInt64("  installation id", a.InstallationID)
+		if a.PrivateKey == "" { // an inline PEM is left alone
+			a.PrivateKeyPath = w.askRequired("  private key path (PEM)", a.PrivateKeyPath)
+		}
+	}
+}
+
+// confirmGitHub checks the assembled credentials against the live API before
+// anything is written. It returns false only when the user chooses to abort:
+// verification that cannot run at all — the referenced env var is not set in
+// this shell, or GitHub is unreachable — is reported and waved through, since
+// the file may still be correct on the machine that will run it.
+func (w *wizard) confirmGitHub(cfg *config.Config) bool {
+	for w.err == nil {
+		detail, err := verifyGitHub(cfg)
+		switch {
+		case err == nil:
+			fmt.Fprintf(w.out, "\n  ✓ %s\n", detail)
+			return true
+		case errors.Is(err, errVerifySkipped):
+			fmt.Fprintf(w.out, "\n  · %v\n", err)
+			return true
+		}
+		fmt.Fprintf(w.out, "\n  ✗ %v\n", err)
+		switch w.askChoice("  github verification failed", []string{"retry", "write-anyway", "abort"}, "retry") {
+		case "retry":
+			w.askGitHubAuth(cfg)
+		case "write-anyway":
+			return true
+		case "abort":
+			return false
+		}
+	}
+	return true
+}
+
+var errVerifySkipped = errors.New("verification skipped")
+
+// verifyGitHub and ghOrgs are swapped out in tests.
+var (
+	verifyGitHub = verifyGitHubLive
+	ghOrgs       = ghOrgsLive
+)
+
+// verifyGitHubLive proves the credential can do the one thing arc needs:
+// manage self-hosted runners in the org. Listing runners exercises exactly
+// that permission (admin:org for a PAT, organization_self_hosted_runners for
+// an App) — the same probe arc doctor uses.
+func verifyGitHubLive(cfg *config.Config) (string, error) {
+	resolved, err := cfg.Resolve()
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", errVerifySkipped, err)
+	}
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	gh, err := ghapi.New(resolved, quiet)
+	if err != nil {
+		return "", err // bad credential material, e.g. an unreadable private key
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	runners, err := gh.ListRunners(ctx)
+	if err != nil {
+		var ae *ghapi.APIError
+		if !errors.As(err, &ae) {
+			return "", fmt.Errorf("%w: cannot reach GitHub: %v", errVerifySkipped, err)
+		}
+		if ghapi.IsNotFound(err) || ghapi.IsForbidden(err) {
+			return "", fmt.Errorf("org %q not found, or the credential cannot manage its "+
+				"runners. A classic PAT needs the admin:org scope; a GitHub App needs "+
+				"organization_self_hosted_runners: write (%v)", resolved.GitHub.Org, err)
+		}
+		return "", err
+	}
+	return fmt.Sprintf("%s can manage runners in %q (%d currently registered)",
+		gh.AuthDescription(), resolved.GitHub.Org, len(runners)), nil
+}
+
+// ghOrgsLive asks the gh CLI, when installed and logged in, which orgs the
+// user belongs to. Best-effort: any failure just means no prefill.
+func ghOrgsLive() []string {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "api", "user/orgs", "--jq", ".[].login").Output()
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(string(out))
 }
 
 func (w *wizard) editPool(cfg *config.Config, p *config.Pool) {

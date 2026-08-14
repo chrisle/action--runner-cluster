@@ -63,6 +63,18 @@ func (c *Config) Marshal() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// Resolve returns a fully loaded copy of the config: rendered to YAML and run
+// through the normal load pipeline, so ${VAR} references are expanded and
+// defaults applied. It fails when a referenced variable is not set in this
+// process's environment.
+func (c *Config) Resolve() (*Config, error) {
+	raw, err := c.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	return Parse(raw)
+}
+
 // IsEnvRef reports whether a value is an unexpanded ${VAR} reference.
 func IsEnvRef(s string) bool {
 	return strings.HasPrefix(s, "${") && strings.HasSuffix(s, "}")
