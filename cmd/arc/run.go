@@ -95,10 +95,18 @@ func loadConfig(path string) (*config.Config, error) {
 	}
 	if path == "" {
 		path = "arc.yaml"
+		// No local arc.yaml: fall back to the per-user config `arc config` writes.
+		if _, err := os.Stat(path); err != nil {
+			if p := config.DefaultUserPath(); p != "" {
+				if _, err := os.Stat(p); err == nil {
+					path = p
+				}
+			}
+		}
 	}
 	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("no config at %s (pass -config, set ARC_CONFIG, or "+
-			"copy config.example.yaml to arc.yaml)", path)
+		return nil, fmt.Errorf("no config at %s (run `arc config` to create one, "+
+			"pass -config, or set ARC_CONFIG)", path)
 	}
 	return config.Load(path)
 }

@@ -22,9 +22,9 @@ const (
 // Config is the whole orchestrator configuration.
 type Config struct {
 	GitHub GitHub  `yaml:"github"`
-	Server Server  `yaml:"server"`
+	Server Server  `yaml:"server,omitempty"`
 	Pools  []*Pool `yaml:"pools"`
-	Log    Log     `yaml:"log"`
+	Log    Log     `yaml:"log,omitempty"`
 
 	// Path the config was loaded from. Set by Load, not by YAML.
 	Path string `yaml:"-"`
@@ -35,60 +35,60 @@ type GitHub struct {
 	// Org is the GitHub organization runners register against.
 	Org string `yaml:"org"`
 	// Token is a classic PAT with admin:org. Mutually exclusive with App.
-	Token string `yaml:"token"`
+	Token string `yaml:"token,omitempty"`
 	// App is GitHub App credentials. Preferred over Token for org-wide use.
-	App *AppAuth `yaml:"app"`
+	App *AppAuth `yaml:"app,omitempty"`
 	// APIURL overrides the API base for GitHub Enterprise Server.
-	APIURL string `yaml:"api_url"`
+	APIURL string `yaml:"api_url,omitempty"`
 	// WebURL overrides the web base (the runner registration URL) for GHES.
-	WebURL string `yaml:"web_url"`
+	WebURL string `yaml:"web_url,omitempty"`
 	// RunnerGroup is the org runner group new runners join. Empty means Default.
-	RunnerGroup string `yaml:"runner_group"`
+	RunnerGroup string `yaml:"runner_group,omitempty"`
 	// PollInterval is how often the orchestrator scans for queued jobs.
-	PollInterval Duration `yaml:"poll_interval"`
+	PollInterval Duration `yaml:"poll_interval,omitempty"`
 	// Repos controls which org repos get polled for queued jobs.
-	Repos RepoFilter `yaml:"repos"`
+	Repos RepoFilter `yaml:"repos,omitempty"`
 }
 
 // AppAuth is GitHub App installation authentication.
 type AppAuth struct {
 	AppID          int64  `yaml:"app_id"`
 	InstallationID int64  `yaml:"installation_id"`
-	PrivateKey     string `yaml:"private_key"`      // PEM contents
-	PrivateKeyPath string `yaml:"private_key_path"` // or a path to the PEM
+	PrivateKey     string `yaml:"private_key,omitempty"`      // PEM contents
+	PrivateKeyPath string `yaml:"private_key_path,omitempty"` // or a path to the PEM
 }
 
 // RepoFilter narrows the set of org repos that get polled. Polling every repo
 // in a large org burns rate limit, so callers can scope it down.
 type RepoFilter struct {
 	// Include, if non-empty, is an allowlist of repo names (glob supported).
-	Include []string `yaml:"include"`
+	Include []string `yaml:"include,omitempty"`
 	// Exclude drops repo names from the set (glob supported).
-	Exclude []string `yaml:"exclude"`
+	Exclude []string `yaml:"exclude,omitempty"`
 	// ActiveWithin only polls repos pushed to within this window. Zero disables
 	// the filter and polls every repo.
-	ActiveWithin Duration `yaml:"active_within"`
+	ActiveWithin Duration `yaml:"active_within,omitempty"`
 	// RefreshInterval is how often the repo list itself is re-fetched.
-	RefreshInterval Duration `yaml:"refresh_interval"`
+	RefreshInterval Duration `yaml:"refresh_interval,omitempty"`
 	// Archived includes archived repos when true.
-	Archived bool `yaml:"archived"`
+	Archived bool `yaml:"archived,omitempty"`
 }
 
 // Server configures the local control API.
 type Server struct {
 	// Addr is the listen address for the control API. Bind to loopback unless
 	// you put an authenticating proxy in front.
-	Addr string `yaml:"addr"`
+	Addr string `yaml:"addr,omitempty"`
 	// StateDir holds runtime state (scale overrides, provider bookkeeping).
-	StateDir string `yaml:"state_dir"`
+	StateDir string `yaml:"state_dir,omitempty"`
 	// Token, if set, is required as a Bearer token on control API requests.
-	Token string `yaml:"token"`
+	Token string `yaml:"token,omitempty"`
 }
 
 // Log configures output.
 type Log struct {
-	Level  string `yaml:"level"`  // debug|info|warn|error
-	Format string `yaml:"format"` // text|json
+	Level  string `yaml:"level,omitempty"`  // debug|info|warn|error
+	Format string `yaml:"format,omitempty"` // text|json
 }
 
 // Pool is one homogeneous group of runners sharing labels and a provider.
@@ -105,78 +105,78 @@ type Pool struct {
 	// Max caps concurrent runners in this pool.
 	Max int `yaml:"max"`
 	// IdleTimeout is how long a surplus idle runner lingers before being culled.
-	IdleTimeout Duration `yaml:"idle_timeout"`
+	IdleTimeout Duration `yaml:"idle_timeout,omitempty"`
 	// JobTimeout force-destroys an instance that has lived this long, as a
 	// guard against jobs that hang without GitHub cancelling them.
-	JobTimeout Duration `yaml:"job_timeout"`
+	JobTimeout Duration `yaml:"job_timeout,omitempty"`
 	// RunnerGroup overrides GitHub.RunnerGroup for this pool.
-	RunnerGroup string `yaml:"runner_group"`
+	RunnerGroup string `yaml:"runner_group,omitempty"`
 
-	Docker  *DockerSpec  `yaml:"docker"`
-	Process *ProcessSpec `yaml:"process"`
+	Docker  *DockerSpec  `yaml:"docker,omitempty"`
+	Process *ProcessSpec `yaml:"process,omitempty"`
 }
 
 // DockerSpec configures the docker provider for a pool.
 type DockerSpec struct {
 	// Host is the Docker Engine endpoint: unix:///var/run/docker.sock,
 	// tcp://host:2375, or npipe:////./pipe/docker_engine on Windows.
-	Host string `yaml:"host"`
+	Host string `yaml:"host,omitempty"`
 	// Image is the runner image. It must contain an actions-runner install and
 	// honour the ARC_JITCONFIG environment variable.
 	Image string `yaml:"image"`
 	// Pull controls image pulling: always|missing|never.
-	Pull string `yaml:"pull"`
+	Pull string `yaml:"pull,omitempty"`
 	// Platform pins a platform for multi-arch images, e.g. linux/amd64.
-	Platform string `yaml:"platform"`
+	Platform string `yaml:"platform,omitempty"`
 	// Privileged runs the container privileged. Needed for docker-in-docker.
-	Privileged bool `yaml:"privileged"`
+	Privileged bool `yaml:"privileged,omitempty"`
 	// Network is the container network mode.
-	Network string `yaml:"network"`
+	Network string `yaml:"network,omitempty"`
 	// Isolation is the Windows container isolation mode: process|hyperv.
-	Isolation string `yaml:"isolation"`
+	Isolation string `yaml:"isolation,omitempty"`
 	// Volumes are extra bind mounts in "src:dst[:ro]" form. Use sparingly:
 	// anything bound in here survives the container and can accumulate.
-	Volumes []string `yaml:"volumes"`
+	Volumes []string `yaml:"volumes,omitempty"`
 	// Env is extra environment for the runner container.
-	Env map[string]string `yaml:"env"`
+	Env map[string]string `yaml:"env,omitempty"`
 	// WorkTmpfs mounts the runner work directory as tmpfs (Linux only), so the
 	// job workspace never touches disk. Ignored on Windows containers.
-	WorkTmpfs bool `yaml:"work_tmpfs"`
+	WorkTmpfs bool `yaml:"work_tmpfs,omitempty"`
 	// WorkTmpfsSize is the tmpfs size, e.g. "8g". Empty means the daemon default.
-	WorkTmpfsSize string `yaml:"work_tmpfs_size"`
+	WorkTmpfsSize string `yaml:"work_tmpfs_size,omitempty"`
 	// WorkDir is the in-container path of the runner work directory.
-	WorkDir string `yaml:"work_dir"`
+	WorkDir string `yaml:"work_dir,omitempty"`
 	// CPUs limits CPU, e.g. 2 or 1.5. Zero means unlimited.
-	CPUs float64 `yaml:"cpus"`
+	CPUs float64 `yaml:"cpus,omitempty"`
 	// Memory limits memory, e.g. "4g". Empty means unlimited.
-	Memory string `yaml:"memory"`
+	Memory string `yaml:"memory,omitempty"`
 	// ShmSize sets /dev/shm, e.g. "2g". Useful for browser test suites.
-	ShmSize string `yaml:"shm_size"`
+	ShmSize string `yaml:"shm_size,omitempty"`
 	// DockerInDocker binds the host docker socket into the container. This
 	// makes container-based job steps work but gives jobs host-level docker
 	// access, so keep it off unless you trust every workflow in the org.
-	DockerInDocker bool `yaml:"docker_in_docker"`
+	DockerInDocker bool `yaml:"docker_in_docker,omitempty"`
 	// TLS configures mutual TLS for a tcp:// daemon.
-	TLS *DockerTLS `yaml:"tls"`
+	TLS *DockerTLS `yaml:"tls,omitempty"`
 	// RegistryAuth supplies credentials for pulling a private runner image.
 	// The daemon does its own pulling, so `docker login` on the host does not
 	// help here: the credentials have to travel with the API request.
-	RegistryAuth *RegistryAuth `yaml:"registry_auth"`
+	RegistryAuth *RegistryAuth `yaml:"registry_auth,omitempty"`
 }
 
 // DockerTLS configures client certificates for a remote daemon.
 type DockerTLS struct {
-	CAFile     string `yaml:"ca_file"`
-	CertFile   string `yaml:"cert_file"`
-	KeyFile    string `yaml:"key_file"`
-	SkipVerify bool   `yaml:"skip_verify"`
+	CAFile     string `yaml:"ca_file,omitempty"`
+	CertFile   string `yaml:"cert_file,omitempty"`
+	KeyFile    string `yaml:"key_file,omitempty"`
+	SkipVerify bool   `yaml:"skip_verify,omitempty"`
 }
 
 // RegistryAuth holds image registry credentials.
 type RegistryAuth struct {
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	Server   string `yaml:"server"`
+	Username string `yaml:"username,omitempty"`
+	Password string `yaml:"password,omitempty"`
+	Server   string `yaml:"server,omitempty"`
 }
 
 // ProcessSpec configures the process provider for a pool. This is how macOS
@@ -184,18 +184,18 @@ type RegistryAuth struct {
 type ProcessSpec struct {
 	// TemplateDir is a pristine actions-runner installation. It is never
 	// modified; each instance gets a copy-on-write clone of it.
-	TemplateDir string `yaml:"template_dir"`
+	TemplateDir string `yaml:"template_dir,omitempty"`
 	// InstancesDir is where per-runner clones live. Each is deleted in full
 	// when its runner exits, which is what keeps caches from accumulating.
-	InstancesDir string `yaml:"instances_dir"`
+	InstancesDir string `yaml:"instances_dir,omitempty"`
 	// Env is extra environment for the runner process.
-	Env map[string]string `yaml:"env"`
+	Env map[string]string `yaml:"env,omitempty"`
 	// User, if set, runs the runner as this user (requires the orchestrator to
 	// run as root). Empty runs as the orchestrator's own user.
-	User string `yaml:"user"`
+	User string `yaml:"user,omitempty"`
 	// PreflightScript, if set, runs before the runner starts. Non-zero exit
 	// aborts the instance.
-	PreflightScript string `yaml:"preflight_script"`
+	PreflightScript string `yaml:"preflight_script,omitempty"`
 }
 
 // Defaults applied when the config leaves a field empty.

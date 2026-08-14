@@ -24,6 +24,7 @@ Usage:
 
 Commands:
   run       Start the orchestrator
+  config    Create or edit the configuration with a wizard
   status    Show pools and runners
   scale     Change a pool's min/max at runtime
   drain     Stop a pool from creating runners
@@ -38,6 +39,7 @@ Configuration is read from, in order of precedence:
   -config <path>
   $ARC_CONFIG
   ./arc.yaml
+  ~/.config/arc/arc.yaml   (written by "arc config")
 `
 
 func main() {
@@ -50,6 +52,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "config":
+		err = cmdConfig(os.Args[2:])
 	case "status":
 		err = cmdStatus(os.Args[2:])
 	case "scale":
