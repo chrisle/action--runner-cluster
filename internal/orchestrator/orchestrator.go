@@ -22,6 +22,7 @@ import (
 
 	"github.com/chrisle/action-runner-cluster/internal/config"
 	"github.com/chrisle/action-runner-cluster/internal/ghapi"
+	"github.com/chrisle/action-runner-cluster/internal/hostid"
 	"github.com/chrisle/action-runner-cluster/internal/provider"
 	"github.com/chrisle/action-runner-cluster/internal/provider/dockerprov"
 	"github.com/chrisle/action-runner-cluster/internal/provider/processprov"
@@ -57,6 +58,10 @@ type Orchestrator struct {
 	// drained pools create no new runners and cull to zero.
 	drainMu sync.RWMutex
 	drained map[string]bool
+
+	// poke wakes the reconcile loop immediately (webhook deliveries). It is
+	// buffered so pokes coalesce instead of queueing redundant passes.
+	poke chan struct{}
 }
 
 // Snapshot is the orchestrator's view of the world, served by `arc status`.
@@ -117,6 +122,7 @@ func New(cfg *config.Config, gh *ghapi.Client, overrides *state.Overrides, log *
 		matcher:   NewPoolMatcher(cfg.Pools),
 		idleSince: make(map[string]time.Time),
 		drained:   make(map[string]bool),
+		poke:      make(chan struct{}, 1),
 	}
 
 	for _, pool := range cfg.Pools {
@@ -191,9 +197,20 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			o.reconcileOnce(ctx)
+		case <-o.poke:
+			o.reconcileOnce(ctx)
 		case <-housekeeping.C:
 			o.housekeep(ctx)
 		}
+	}
+}
+
+// Poke asks the loop to reconcile now instead of waiting for the next tick.
+// Non-blocking; concurrent pokes coalesce into one pass.
+func (o *Orchestrator) Poke() {
+	select {
+	case o.poke <- struct{}{}:
+	default:
 	}
 }
 
@@ -201,6 +218,18 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 // tick is logged and surfaced in the snapshot, and the next tick tries again.
 func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 	start := time.Now()
+
+	// Circuit breaker: when the API budget is nearly gone, doing a pass would
+	// finish it off and starve even the recovery. Sit out until the window
+	// resets — GitHub queues the jobs, and the first pass after reset sees them.
+	if rl := o.gh.RateLimit(); rl.Limit > 0 && rl.Remaining < 50 && start.Before(rl.Reset) {
+		o.log.Warn("rate limit nearly exhausted; pausing reconciliation",
+			"remaining", rl.Remaining, "reset", rl.Reset.Format(time.Kitchen))
+		o.recordFailure(fmt.Sprintf("rate limit nearly exhausted (%d left); paused until %s",
+			rl.Remaining, rl.Reset.Format(time.Kitchen)))
+		return
+	}
+
 	snap := Snapshot{UpdatedAt: start, Org: o.cfg.GitHub.Entity()}
 
 	// 1. Which repos are watched. This comes first because in personal-account
@@ -262,6 +291,7 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 	}
 	demand := o.matcher.AssignDemand(jobs, liveCounts, limits)
 	snap.Unassigned = demand.Unassigned
+	o.discountForeignIdle(&demand, runners, liveByPool)
 
 	if len(demand.Unassigned) > 0 {
 		for _, j := range demand.Unassigned {
@@ -569,6 +599,84 @@ func (o *Orchestrator) scaleDown(ctx context.Context, pool *config.Pool, live []
 	}
 }
 
+// discountForeignIdle drops queued jobs that an idle runner outside this
+// host's control — another arc host, or a manually registered runner — is
+// already online to take. Without it, every arc host serving the account
+// would launch a runner for every queued job and all but one would sit idle
+// until culled. In personal-account mode a runner only serves the repo it is
+// registered on, so slots are matched repo-aware.
+func (o *Orchestrator) discountForeignIdle(d *Demand, runners []ghapi.Runner, liveByPool map[string][]provider.Instance) {
+	ours := make(map[string]bool)
+	for _, insts := range liveByPool {
+		for _, in := range insts {
+			ours[in.RunnerName] = true
+		}
+	}
+	isOurDebris := func(name string) bool {
+		for _, p := range o.cfg.Pools {
+			if belongsToPool(name, p.Name) {
+				return true
+			}
+		}
+		return false
+	}
+
+	type slot struct {
+		labels map[string]bool
+		repo   string
+	}
+	var free []slot
+	for _, r := range runners {
+		if ours[r.Name] || r.Busy || !r.Online() || isOurDebris(r.Name) {
+			continue
+		}
+		labels := make(map[string]bool, len(r.Labels))
+		for _, l := range r.Labels {
+			labels[strings.ToLower(l.Name)] = true
+		}
+		free = append(free, slot{labels: labels, repo: r.Repo})
+	}
+	if len(free) == 0 {
+		return
+	}
+
+	covers := func(s slot, j ghapi.Job) bool {
+		if s.repo != "" && !strings.EqualFold(s.repo, j.Repo) {
+			return false
+		}
+		for _, want := range j.Labels {
+			if !s.labels[strings.ToLower(want)] {
+				return false
+			}
+		}
+		return true
+	}
+
+	for _, pool := range o.cfg.Pools {
+		jobs := d.Jobs[pool.Name]
+		remaining := jobs[:0]
+		for _, j := range jobs {
+			consumed := false
+			for i, s := range free {
+				if covers(s, j) {
+					free = append(free[:i], free[i+1:]...)
+					consumed = true
+					break
+				}
+			}
+			if !consumed {
+				remaining = append(remaining, j)
+			}
+		}
+		if len(remaining) != len(jobs) {
+			o.log.Debug("demand covered by foreign idle runners",
+				"pool", pool.Name, "covered", len(jobs)-len(remaining))
+		}
+		d.Jobs[pool.Name] = remaining
+		d.ByPool[pool.Name] = len(remaining)
+	}
+}
+
 // limitsFor returns a pool's min/max after applying any live override.
 func (o *Orchestrator) limitsFor(pool *config.Pool) Limits {
 	lim := Limits{Min: pool.Min, Max: pool.Max}
@@ -727,21 +835,25 @@ func (o *Orchestrator) Healthy() (bool, string) {
 // runnerSuffixLen is the length of the random hex suffix in a runner name.
 const runnerSuffixLen = 8
 
-// runnerName builds a unique runner name that encodes its pool, so orphaned
-// registrations can be attributed back to a pool without extra state.
+// runnerName builds a unique runner name encoding its pool and this host, so
+// orphaned registrations can be attributed without extra state. The host id
+// matters when several arc hosts serve one account: without it, host A would
+// see host B's freshly registered runner, find no local instance behind it,
+// and deregister it as an orphan.
 func runnerName(pool string) string {
 	var b [runnerSuffixLen / 2]byte
 	_, _ = rand.Read(b[:])
-	return fmt.Sprintf("arc-%s-%s", pool, hex.EncodeToString(b[:]))
+	return fmt.Sprintf("arc-%s-%s-%s", pool, hostid.ID(), hex.EncodeToString(b[:]))
 }
 
-// belongsToPool reports whether a runner name was minted for the given pool.
+// belongsToPool reports whether a runner name was minted for the given pool
+// by THIS host. Other hosts' runners are never ours to reap.
 //
-// The exact-length hex suffix check matters: pools named "linux" and
-// "linux-gpu" both produce names starting with "arc-linux-", and a loose prefix
-// test would let the linux pool deregister the gpu pool's runners.
+// The exact-length suffix check matters: pools named "linux" and "linux-gpu"
+// both produce names starting with "arc-linux-", and a loose prefix test
+// would let the linux pool deregister the gpu pool's runners.
 func belongsToPool(runner, pool string) bool {
-	prefix := "arc-" + pool + "-"
+	prefix := "arc-" + pool + "-" + hostid.ID() + "-"
 	if !strings.HasPrefix(runner, prefix) {
 		return false
 	}

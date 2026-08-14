@@ -5,6 +5,7 @@ import (
 
 	"github.com/chrisle/action-runner-cluster/internal/config"
 	"github.com/chrisle/action-runner-cluster/internal/ghapi"
+	"github.com/chrisle/action-runner-cluster/internal/hostid"
 )
 
 func TestPlan(t *testing.T) {
@@ -258,19 +259,25 @@ func TestAssignDemandReportsUnservableJobs(t *testing.T) {
 }
 
 func TestBelongsToPool(t *testing.T) {
+	me := hostid.ID()
 	tests := []struct {
 		runner string
 		pool   string
 		want   bool
 	}{
-		{"arc-linux-a1b2c3d4", "linux", true},
-		{"arc-linux-gpu-a1b2c3d4", "linux-gpu", true},
+		{"arc-linux-" + me + "-a1b2c3d4", "linux", true},
+		{"arc-linux-gpu-" + me + "-a1b2c3d4", "linux-gpu", true},
 		// The collision that a naive prefix check gets wrong: the linux pool
 		// must not claim (and then deregister) linux-gpu's runners.
-		{"arc-linux-gpu-a1b2c3d4", "linux", false},
-		{"arc-linux-a1b2c3d4", "linux-gpu", false},
-		{"arc-linux-NOTHEX!", "linux", false},
-		{"arc-linux-a1b2c3", "linux", false},
+		{"arc-linux-gpu-" + me + "-a1b2c3d4", "linux", false},
+		{"arc-linux-" + me + "-a1b2c3d4", "linux-gpu", false},
+		// Another arc host's runner is never ours to reap, even in the same
+		// pool — that is what lets several hosts serve one account.
+		{"arc-linux-ffffff-a1b2c3d4", "linux", false},
+		// Pre-multi-host name format: also not ours.
+		{"arc-linux-a1b2c3d4", "linux", false},
+		{"arc-linux-" + me + "-NOTHEX!", "linux", false},
+		{"arc-linux-" + me + "-a1b2c3", "linux", false},
 		{"some-other-runner", "linux", false},
 		{"arc-linux-", "linux", false},
 	}

@@ -44,6 +44,10 @@ type GitHub struct {
 	Token string `yaml:"token,omitempty"`
 	// App is GitHub App credentials. Preferred over Token for org-wide use.
 	App *AppAuth `yaml:"app,omitempty"`
+	// Webhook switches to event-driven scaling: arc opens a Cloudflare quick
+	// tunnel, registers workflow_job webhooks, and reconciles the moment a
+	// job queues, so polling drops to a slow safety net.
+	Webhook bool `yaml:"webhook,omitempty"`
 	// APIURL overrides the API base for GitHub Enterprise Server.
 	APIURL string `yaml:"api_url,omitempty"`
 	// WebURL overrides the web base (the runner registration URL) for GHES.
@@ -206,13 +210,16 @@ type ProcessSpec struct {
 
 // Defaults applied when the config leaves a field empty.
 const (
-	DefaultPollInterval     = 15 * time.Second
-	DefaultIdleTimeout      = 5 * time.Minute
-	DefaultJobTimeout       = 6 * time.Hour
-	DefaultRepoRefresh      = 10 * time.Minute
-	DefaultAddr             = "127.0.0.1:8730"
-	DefaultDockerWorkDir    = "/home/runner/_work"
-	DefaultWinDockerWorkDir = `C:\actions-runner\_work`
+	DefaultPollInterval      = 15 * time.Second
+	DefaultWebhookPoll       = 2 * time.Minute
+	DefaultOwnerActiveWithin = 720 * time.Hour // 30 days
+	DefaultMaxRunners        = 4
+	DefaultIdleTimeout       = 5 * time.Minute
+	DefaultJobTimeout        = 6 * time.Hour
+	DefaultRepoRefresh       = 10 * time.Minute
+	DefaultAddr              = "127.0.0.1:8730"
+	DefaultDockerWorkDir     = "/home/runner/_work"
+	DefaultWinDockerWorkDir  = `C:\actions-runner\_work`
 )
 
 var poolNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
@@ -340,7 +347,19 @@ func dedupe(in []string) []string {
 
 func (c *Config) applyDefaults() {
 	if c.GitHub.PollInterval == 0 {
-		c.GitHub.PollInterval = Duration(DefaultPollInterval)
+		if c.GitHub.Webhook {
+			// Webhooks carry the urgency; polling is only the safety net for
+			// missed deliveries, so it can be slow and cheap.
+			c.GitHub.PollInterval = Duration(DefaultWebhookPoll)
+		} else {
+			c.GitHub.PollInterval = Duration(DefaultPollInterval)
+		}
+	}
+	// A personal account can own hundreds of repos, and in owner mode each
+	// watched repo costs API traffic. Unless the user scoped the set
+	// explicitly, only watch repos with recent pushes.
+	if c.GitHub.Owner != "" && len(c.GitHub.Repos.Include) == 0 && c.GitHub.Repos.ActiveWithin == 0 {
+		c.GitHub.Repos.ActiveWithin = Duration(DefaultOwnerActiveWithin)
 	}
 	if c.GitHub.APIURL == "" {
 		c.GitHub.APIURL = "https://api.github.com"
@@ -575,6 +594,33 @@ func (g GitHub) Entity() string {
 		return g.Owner
 	}
 	return g.Org
+}
+
+// HostPool is the pool for the machine arc is running on: the process
+// provider (works on every OS with no image to configure — the runner
+// template downloads itself), labelled for this platform, scaling from zero.
+func HostPool(max int) *Pool {
+	if max < 1 {
+		max = DefaultMaxRunners
+	}
+	name, osLabel := "linux", "linux"
+	switch runtime.GOOS {
+	case "darwin":
+		name, osLabel = "macos", "macos"
+	case "windows":
+		name, osLabel = "windows", "windows"
+	}
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "x64"
+	}
+	return &Pool{
+		Name:     name,
+		Labels:   []string{"self-hosted", osLabel, arch},
+		Provider: ProviderProcess,
+		Min:      0,
+		Max:      max,
+	}
 }
 
 // Pool returns the named pool, or nil.

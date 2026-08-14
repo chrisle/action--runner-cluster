@@ -40,7 +40,10 @@ Configuration is read from, in order of precedence:
   -config <path>
   $ARC_CONFIG
   ./arc.yaml
-  ~/.config/arc/arc.yaml   (written by "arc config")
+  ~/.config/arc/arc.yaml            (written by "arc config")
+  1Password op://arc/github         (no file needed: the vault holds the
+                                     account + token, and this machine serves
+                                     its own platform — see "arc run -max")
 `
 
 func main() {

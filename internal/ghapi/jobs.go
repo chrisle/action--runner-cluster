@@ -17,6 +17,7 @@ type Repo struct {
 	FullName string    `json:"full_name"`
 	Archived bool      `json:"archived"`
 	Disabled bool      `json:"disabled"`
+	Fork     bool      `json:"fork"`
 	PushedAt time.Time `json:"pushed_at"`
 	Owner    struct {
 		Login string `json:"login"`
@@ -110,6 +111,11 @@ func (c *Client) ListRepos(ctx context.Context, filter RepoFilterOpts) ([]Repo, 
 				break
 			}
 			if c.owner != "" && !strings.EqualFold(r.Owner.Login, c.owner) {
+				continue
+			}
+			// Forks rarely run their own Actions; watching them multiplies
+			// API cost for nothing. An explicit include list overrides this.
+			if c.owner != "" && r.Fork && len(filter.Include) == 0 {
 				continue
 			}
 			if r.Disabled {

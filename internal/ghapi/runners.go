@@ -66,7 +66,14 @@ func (c *Client) ListRunners(ctx context.Context, repos []Repo) ([]Runner, error
 
 func (c *Client) listRunnersAt(ctx context.Context, path, repo string) ([]Runner, error) {
 	var all []Runner
-	err := c.paginate(ctx, path, "", func(page []byte) error {
+	// Conditional on an ETag: runner sets change rarely, and a 304 answer is
+	// free against the rate limit. Without this, per-repo listings in
+	// personal-account mode would burn the whole hourly budget on their own.
+	etagKey := "runners:org"
+	if repo != "" {
+		etagKey = "runners:" + repo
+	}
+	err := c.paginate(ctx, path, etagKey, func(page []byte) error {
 		var out struct {
 			Runners []Runner `json:"runners"`
 		}
