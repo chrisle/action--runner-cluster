@@ -1,0 +1,16 @@
+name: selfhosted-smoke
+
+# Manual smoke test for the arc runner cluster: dispatch it and a runner on
+# whichever arc host serves this platform should pick it up within seconds.
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - name: Prove where we ran
+        run: |
+          echo "ran on $(uname -mrs) as $(whoami)"
+          echo "runner name: $RUNNER_NAME"
+          echo "workspace: $GITHUB_WORKSPACE"
