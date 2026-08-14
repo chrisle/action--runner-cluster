@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -28,9 +29,10 @@ func TestConfigWizardCreates(t *testing.T) {
 	stubWizardHooks(t)
 	path := filepath.Join(t.TempDir(), "arc.yaml")
 	input := strings.Join([]string{
-		"my-org", // organization
 		"",       // auth method → token
 		"",       // token → ${GITHUB_TOKEN}
+		"my-org", // organization
+		"y",      // customize? → yes
 		"30s",    // poll interval
 		"",       // runner group → empty
 		// first pool (mandatory)
@@ -110,9 +112,9 @@ pools:
 		t.Fatal(err)
 	}
 
-	// All-Enter session: org, auth method, token, poll interval, runner group,
-	// pool action (keep), add another (no).
-	input := strings.Repeat("\n", 7)
+	// All-Enter session: auth method, token, organization, customize (no).
+	// Declining customization must not even ask about the pools.
+	input := strings.Repeat("\n", 4)
 	var out bytes.Buffer
 	if err := runConfigWizard(path, strings.NewReader(input), &out); err != nil {
 		t.Fatalf("wizard: %v\noutput:\n%s", err, out.String())
@@ -155,23 +157,47 @@ func TestConfigWizardAbortWritesNothing(t *testing.T) {
 	}
 }
 
-// createFlowInput is a full create session up to (not including) any
-// verification prompts: blank org accepts the gh prefill when there is one.
+// createFlowInput is the fast-path create session — auth, org, no
+// customization — up to (not including) any verification prompts. A blank
+// org accepts the gh prefill when there is one.
 func createFlowInput(org string) string {
 	return strings.Join([]string{
-		org,      // organization
-		"",       // auth method → token
-		"",       // token → ${GITHUB_TOKEN}
-		"",       // poll interval
-		"",       // runner group
-		"linux",  // pool name
-		"docker", // provider
-		"",       // labels
-		"0",      // min
-		"4",      // max
-		"",       // image
-		"",       // add another pool? → no
+		"",  // auth method → token
+		"",  // token → ${GITHUB_TOKEN}
+		org, // organization
+		"",  // customize? → no
 	}, "\n") + "\n"
+}
+
+func TestConfigWizardDefaultsWithoutCustomization(t *testing.T) {
+	stubWizardHooks(t)
+	path := filepath.Join(t.TempDir(), "arc.yaml")
+	var out bytes.Buffer
+	if err := runConfigWizard(path, strings.NewReader(createFlowInput("my-org")), &out); err != nil {
+		t.Fatalf("wizard: %v\noutput:\n%s", err, out.String())
+	}
+	raw, _ := os.ReadFile(path)
+	cfg, err := config.ParseEditable(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Pools) != 1 {
+		t.Fatalf("pools = %d, want one default pool", len(cfg.Pools))
+	}
+	p := cfg.Pools[0]
+	wantProvider := config.ProviderDocker
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		wantProvider = config.ProviderProcess
+	}
+	if p.Provider != wantProvider {
+		t.Errorf("default pool provider = %q, want %q on %s", p.Provider, wantProvider, runtime.GOOS)
+	}
+	if p.Max < 1 || len(p.Labels) == 0 {
+		t.Errorf("default pool is not viable: %+v", p)
+	}
+	if got := cfg.GitHub.PollInterval.String(); got != "15s" {
+		t.Errorf("poll_interval = %s, want the 15s default", got)
+	}
 }
 
 func TestConfigWizardPrefillsOrgFromGH(t *testing.T) {
@@ -210,9 +236,9 @@ func TestConfigWizardVerifyFailureRetry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "arc.yaml")
 	input := createFlowInput("my-org") + strings.Join([]string{
 		"retry",             // verification failed → retry
-		"",                  // organization (keep)
 		"",                  // auth method (keep token)
 		"ghp_goodtoken1234", // new token
+		"",                  // organization (keep)
 	}, "\n") + "\n"
 	var out bytes.Buffer
 	if err := runConfigWizard(path, strings.NewReader(input), &out); err != nil {

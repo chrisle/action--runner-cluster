@@ -74,36 +74,50 @@ func runConfigWizard(path string, in io.Reader, out io.Writer) error {
 
 	fmt.Fprintln(out, "\ngithub")
 	w.askGitHubAuth(cfg)
-	cfg.GitHub.PollInterval = w.askDuration("  poll interval",
-		cfg.GitHub.PollInterval, config.DefaultPollInterval)
-	cfg.GitHub.RunnerGroup = w.ask("  runner group (empty = Default)", cfg.GitHub.RunnerGroup)
 
-	fmt.Fprintln(out, "\npools")
-	kept := cfg.Pools[:0]
-	for _, p := range cfg.Pools {
-		if p == nil {
-			continue
+	if w.askBool("\ncustomize the configuration (poll interval, runner group, pools)?", false) {
+		cfg.GitHub.PollInterval = w.askDuration("  poll interval",
+			cfg.GitHub.PollInterval, config.DefaultPollInterval)
+		cfg.GitHub.RunnerGroup = w.ask("  runner group (empty = Default)", cfg.GitHub.RunnerGroup)
+
+		fmt.Fprintln(out, "\npools")
+		kept := cfg.Pools[:0]
+		for _, p := range cfg.Pools {
+			if p == nil {
+				continue
+			}
+			label := fmt.Sprintf("  pool %q (%s, labels %s, min %d max %d)",
+				p.Name, p.Provider, strings.Join(p.Labels, "/"), p.Min, p.Max)
+			switch w.askChoice(label, []string{"keep", "edit", "delete"}, "keep") {
+			case "keep":
+				kept = append(kept, p)
+			case "edit":
+				w.editPool(cfg, p)
+				kept = append(kept, p)
+			case "delete":
+			}
 		}
-		label := fmt.Sprintf("  pool %q (%s, labels %s, min %d max %d)",
-			p.Name, p.Provider, strings.Join(p.Labels, "/"), p.Min, p.Max)
-		switch w.askChoice(label, []string{"keep", "edit", "delete"}, "keep") {
-		case "keep":
-			kept = append(kept, p)
-		case "edit":
+		cfg.Pools = kept
+
+		for w.err == nil && (len(cfg.Pools) == 0 || w.askBool("  add another pool?", false)) {
+			if len(cfg.Pools) == 0 {
+				fmt.Fprintln(out, "  at least one pool is required — define the first:")
+			}
+			p := &config.Pool{}
 			w.editPool(cfg, p)
-			kept = append(kept, p)
-		case "delete":
+			cfg.Pools = append(cfg.Pools, p)
 		}
-	}
-	cfg.Pools = kept
-
-	for w.err == nil && (len(cfg.Pools) == 0 || w.askBool("  add another pool?", false)) {
-		if len(cfg.Pools) == 0 {
-			fmt.Fprintln(out, "  at least one pool is required — define the first:")
+	} else if len(cfg.Pools) == 0 {
+		// A fresh config with no customization: give it a pool that works on
+		// this host with no further setup (the runner template downloads
+		// itself, so a process pool needs nothing else).
+		p := defaultPool(cfg)
+		cfg.Pools = []*config.Pool{p}
+		fmt.Fprintf(out, "  default pool %q: %s, labels %s, min %d max %d\n",
+			p.Name, p.Provider, strings.Join(p.Labels, "/"), p.Min, p.Max)
+		if p.Docker != nil {
+			fmt.Fprintf(out, "  runner image %s — rerun arc config to change it\n", p.Docker.Image)
 		}
-		p := &config.Pool{}
-		w.editPool(cfg, p)
-		cfg.Pools = append(cfg.Pools, p)
 	}
 
 	if w.err != nil {
@@ -135,19 +149,9 @@ func runConfigWizard(path string, in io.Reader, out io.Writer) error {
 	return nil
 }
 
-// askGitHubAuth prompts for the org and credentials — the slice of the config
-// that gets re-asked when live verification fails.
+// askGitHubAuth prompts for the credentials and the org they administer — the
+// slice of the config that gets re-asked when live verification fails.
 func (w *wizard) askGitHubAuth(cfg *config.Config) {
-	if cfg.GitHub.Org == "" {
-		if orgs := ghOrgs(); len(orgs) > 0 {
-			if len(orgs) > 1 {
-				fmt.Fprintf(w.out, "  your organizations (from gh): %s\n", strings.Join(orgs, ", "))
-			}
-			cfg.GitHub.Org = orgs[0]
-		}
-	}
-	cfg.GitHub.Org = w.askRequired("  organization", cfg.GitHub.Org)
-
 	method := "token"
 	if cfg.GitHub.App != nil {
 		method = "app"
@@ -171,6 +175,54 @@ func (w *wizard) askGitHubAuth(cfg *config.Config) {
 		a.InstallationID = w.askInt64("  installation id", a.InstallationID)
 		if a.PrivateKey == "" { // an inline PEM is left alone
 			a.PrivateKeyPath = w.askRequired("  private key path (PEM)", a.PrivateKeyPath)
+		}
+	}
+
+	if cfg.GitHub.Org == "" {
+		if orgs := ghOrgs(); len(orgs) > 0 {
+			if len(orgs) > 1 {
+				fmt.Fprintf(w.out, "  your organizations (from gh): %s\n", strings.Join(orgs, ", "))
+			}
+			cfg.GitHub.Org = orgs[0]
+		}
+	}
+	cfg.GitHub.Org = w.askRequired("  organization", cfg.GitHub.Org)
+}
+
+// defaultPool is the zero-question pool for the host: process on macOS and
+// Windows (no image needed, and the runner template bootstraps itself),
+// docker on Linux with a best-guess image.
+func defaultPool(cfg *config.Config) *config.Pool {
+	switch runtime.GOOS {
+	case "darwin":
+		return &config.Pool{
+			Name:     "macos",
+			Labels:   defaultLabels(config.ProviderProcess),
+			Provider: config.ProviderProcess,
+			Min:      0,
+			Max:      4,
+		}
+	case "windows":
+		// Each concurrent runner is a full template copy on NTFS, so keep the
+		// default ceiling low.
+		return &config.Pool{
+			Name:     "windows",
+			Labels:   defaultLabels(config.ProviderProcess),
+			Provider: config.ProviderProcess,
+			Min:      0,
+			Max:      2,
+		}
+	default:
+		return &config.Pool{
+			Name:     "linux",
+			Labels:   defaultLabels(config.ProviderDocker),
+			Provider: config.ProviderDocker,
+			Min:      0,
+			Max:      4,
+			Docker: &config.DockerSpec{
+				Image: fmt.Sprintf("ghcr.io/%s/arc-runner:linux", orgPlaceholder(cfg)),
+				Pull:  "missing",
+			},
 		}
 	}
 }
