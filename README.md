@@ -189,12 +189,27 @@ workloads:
 | macos | Xcode Command Line Tools, `rustup` |
 | windows | VS Build Tools 2022 (MSVC), Windows SDK (`signtool`), `pwsh` 7, .NET 8 runtime, `rustup` |
 
-Two gotchas:
+Three gotchas:
 
 - **PATH is captured when arc starts.** Runners inherit arc's environment, so a
   tool installed after arc came up (e.g. `rustup-init` appending to the Windows
   user PATH) is invisible to jobs until arc restarts. Restart when
   `/v1/status` shows `busy: 0`.
+- **On Windows, `bash` must be Git Bash — not WSL.** Actions runs every
+  `shell: bash` step, and the bash half of many composite actions
+  (`dtolnay/rust-toolchain` among them), through whatever `bash` PATH resolves
+  to first. If that is WSL's app-execution alias under `WindowsApps`, every one
+  of those steps fails with a mangled path:
+
+  ```
+  /bin/bash: C:Userschris.arcinstances..._temp_xyz.sh: No such file or directory
+  ```
+
+  WSL bash cannot open a Windows path, and the backslashes vanish as escapes.
+  GitHub-hosted runners ship Git Bash first on PATH; a workstation usually does
+  not. Fix it for runners alone by prepending `C:\Program Files\Git\bin` in
+  arc's launcher script rather than to the user PATH, so interactive shells
+  keep whatever `bash` their owner expects.
 - Keep host tools out of the runner template itself — templates must stay
   unconfigured and generic.
 
