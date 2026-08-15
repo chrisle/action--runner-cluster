@@ -169,6 +169,35 @@ As a service: `deploy/systemd/arc.service` (Linux),
 not a LaunchDaemon, or code signing will fail),
 `deploy/windows/install-service.ps1` (Windows).
 
+## Host tooling for process pools
+
+Docker pools get their tools from the image. **Process pools get them from the
+host**: each ephemeral runner is a clean clone of the runner template, but it
+executes directly on the machine, so every CLI a workflow step calls must
+already be installed there. `setup-*` actions that download their own toolchain
+(`actions/setup-node`, `swatinem/rust-cache`) still work; anything a workflow
+assumes was preinstalled on a GitHub-hosted image does not.
+
+What the current fleet needed to take over a Tauri desktop-app release
+workflow (build + sign + notarize on macOS, build + Azure Trusted Signing on
+Windows, publish via `gh` on Linux) — a reasonable checklist for similar
+workloads:
+
+| Pool | Host-provided tools |
+| --- | --- |
+| linux | `gh`, `jq`, plus the runner system libs (`installdependencies.sh`) |
+| macos | Xcode Command Line Tools, `rustup` |
+| windows | VS Build Tools 2022 (MSVC), Windows SDK (`signtool`), `pwsh` 7, .NET 8 runtime, `rustup` |
+
+Two gotchas:
+
+- **PATH is captured when arc starts.** Runners inherit arc's environment, so a
+  tool installed after arc came up (e.g. `rustup-init` appending to the Windows
+  user PATH) is invisible to jobs until arc restarts. Restart when
+  `/v1/status` shows `busy: 0`.
+- Keep host tools out of the runner template itself — templates must stay
+  unconfigured and generic.
+
 ## Topology
 
 Run **one** orchestrator. It polls GitHub once and drives every pool:
